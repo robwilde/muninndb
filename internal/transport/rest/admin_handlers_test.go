@@ -2,13 +2,16 @@ package rest
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
+	"github.com/scrypster/muninndb/internal/audit"
 	"github.com/scrypster/muninndb/internal/auth"
 	"github.com/scrypster/muninndb/internal/config"
 	"github.com/scrypster/muninndb/internal/plugin"
@@ -836,5 +839,200 @@ func TestEntityGraph_AllowedWithValidSession(t *testing.T) {
 	}
 	if resp.Nodes == nil || resp.Edges == nil {
 		t.Error("expected non-nil nodes and edges")
+	}
+}
+
+// mockEngineWithStats embeds MockEngine but allows controlling EmbedStats and CountEmbedded.
+type mockEngineWithStats struct {
+	MockEngine
+	embedStats    plugin.RetroactiveStats
+	embeddedCount int64
+	totalCount    int64
+}
+
+func (m *mockEngineWithStats) EmbedStats() plugin.RetroactiveStats {
+	return m.embedStats
+}
+
+func (m *mockEngineWithStats) CountEmbedded(ctx context.Context) int64 {
+	return m.embeddedCount
+}
+
+func (m *mockEngineWithStats) Stat(ctx context.Context, req *StatRequest) (*StatResponse, error) {
+	return &StatResponse{
+		EngramCount:  m.totalCount,
+		VaultCount:   1,
+		StorageBytes: 1024,
+	}, nil
+}
+
+// TestHandleEmbedStatus_IncludesRateAndETA verifies that rate_per_sec and eta_seconds
+// are populated from EmbedStats when the server is actively indexing.
+func TestHandleEmbedStatus_IncludesRateAndETA(t *testing.T) {
+	eng := &mockEngineWithStats{
+		embedStats: plugin.RetroactiveStats{
+			RatePerSec: 1.5,
+			ETASeconds: 120,
+		},
+		embeddedCount: 50,  // less than total → indexing=true
+		totalCount:    100,
+	}
+	srv := NewServer("localhost:0", eng, nil, nil, nil, EmbedInfo{Provider: "ollama", Model: "nomic"}, EnrichInfo{}, nil, "", nil)
+
+	req := httptest.NewRequest("GET", "/api/admin/embed/status", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp EmbedStatusResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Indexing {
+		t.Error("expected indexing=true")
+	}
+	if resp.RatePerSec != 1.5 {
+		t.Errorf("expected rate_per_sec=1.5, got %v", resp.RatePerSec)
+	}
+	if resp.ETASeconds != 120 {
+		t.Errorf("expected eta_seconds=120, got %v", resp.ETASeconds)
+	}
+}
+
+// TestHandleEmbedStatus_ZeroRateWhenIdle verifies that rate_per_sec and eta_seconds
+// are 0 when the server is not actively indexing (all engrams already embedded).
+func TestHandleEmbedStatus_ZeroRateWhenIdle(t *testing.T) {
+	eng := &mockEngineWithStats{
+		embedStats: plugin.RetroactiveStats{
+			RatePerSec: 5.0,
+			ETASeconds: 999,
+		},
+		embeddedCount: 100,  // equal to total → indexing=false
+		totalCount:    100,
+	}
+	srv := NewServer("localhost:0", eng, nil, nil, nil, EmbedInfo{Provider: "ollama", Model: "nomic"}, EnrichInfo{}, nil, "", nil)
+
+	req := httptest.NewRequest("GET", "/api/admin/embed/status", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp EmbedStatusResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Indexing {
+		t.Error("expected indexing=false when all engrams are embedded")
+	}
+	if resp.RatePerSec != 0 {
+		t.Errorf("expected rate_per_sec=0 when idle, got %v", resp.RatePerSec)
+	}
+	if resp.ETASeconds != 0 {
+		t.Errorf("expected eta_seconds=0 when idle, got %v", resp.ETASeconds)
+	}
+}
+
+// TestHandleEmbedStatus_HardwareAccelerated verifies that hardware_accelerated
+// is reflected correctly in the response when set on the server.
+func TestHandleEmbedStatus_HardwareAccelerated(t *testing.T) {
+	trueVal := true
+	eng := &mockEngineWithStats{
+		embeddedCount: 100,
+		totalCount:    100,
+	}
+	srv := NewServer("localhost:0", eng, nil, nil, nil,
+		EmbedInfo{Provider: "ollama", Model: "nomic", HardwareAccelerated: &trueVal},
+		EnrichInfo{}, nil, "", nil)
+
+	req := httptest.NewRequest("GET", "/api/admin/embed/status", nil)
+	w := httptest.NewRecorder()
+	srv.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp EmbedStatusResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.HardwareAccelerated == nil {
+		t.Fatal("expected hardware_accelerated to be non-nil")
+	}
+	if !*resp.HardwareAccelerated {
+		t.Error("expected hardware_accelerated=true")
+	}
+}
+
+// TestRevokeAPIKey_EmitsAuditEvent verifies that revoking an API key emits an
+// audit event with action="api_key.revoke".
+func TestRevokeAPIKey_EmitsAuditEvent(t *testing.T) {
+	var mu sync.Mutex
+	var got []audit.AuditEvent
+	sink := audit.SinkFunc(func(e audit.AuditEvent) error {
+		mu.Lock()
+		got = append(got, e)
+		mu.Unlock()
+		return nil
+	})
+	l := audit.New(audit.Config{BufferSize: 16}, sink)
+
+	store := newTestAuthStore(t)
+	srv := newTestServer(t, store)
+	srv.SetAuditLogger(l)
+
+	// Create a key first.
+	body, _ := json.Marshal(map[string]string{"vault": "default", "label": "to-revoke", "mode": "full"})
+	createReq := httptest.NewRequest("POST", "/api/admin/keys", bytes.NewReader(body))
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	srv.mux.ServeHTTP(createW, createReq)
+	if createW.Code != http.StatusCreated {
+		t.Fatalf("setup: create key failed: %s", createW.Body.String())
+	}
+
+	var createResp map[string]interface{}
+	json.NewDecoder(createW.Body).Decode(&createResp)
+	keyMeta := createResp["key"].(map[string]interface{})
+	keyID := keyMeta["id"].(string)
+
+	// Revoke the key.
+	revokeReq := httptest.NewRequest("DELETE", "/api/admin/keys/"+keyID+"?vault=default", nil)
+	revokeW := httptest.NewRecorder()
+	srv.mux.ServeHTTP(revokeW, revokeReq)
+	if revokeW.Code != http.StatusOK {
+		t.Fatalf("expected 200 on revoke, got %d: %s", revokeW.Code, revokeW.Body.String())
+	}
+
+	_ = l.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Find the api_key.revoke event (there may also be an api_key.create event).
+	var revokeEvent *audit.AuditEvent
+	for i := range got {
+		if got[i].Action == "api_key.revoke" {
+			revokeEvent = &got[i]
+			break
+		}
+	}
+	if revokeEvent == nil {
+		t.Fatalf("no api_key.revoke audit event found; got %d events: %v", len(got), got)
+	}
+	if revokeEvent.TargetType != "api_key" {
+		t.Errorf("want TargetType=api_key, got %q", revokeEvent.TargetType)
+	}
+	if revokeEvent.TargetID != keyID {
+		t.Errorf("want TargetID=%q, got %q", keyID, revokeEvent.TargetID)
+	}
+	if revokeEvent.Result != "ok" {
+		t.Errorf("want Result=ok, got %q", revokeEvent.Result)
 	}
 }

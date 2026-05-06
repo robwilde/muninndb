@@ -54,6 +54,11 @@ type Weights struct {
 	ACTRDecay    float32 // power-law decay exponent d (0 → default 0.5)
 	ACTRHebScale float32 // Hebbian scaling inside softplus (0 → default 4.0)
 	DisableACTR  bool    // when true, force legacy weighted-sum scoring (overrides UseACTR)
+	// RRF fusion mode: when true, use Phase 3 RRF scores directly as the scoring
+	// basis in Phase 6, bypassing ACT-R/CGDN/weighted-sum recomputation.
+	// Rank-based and scale-invariant (Cormack et al. 2009). Cognitive boosts
+	// (Hebbian, PAS transition, confidence) are applied after fusion.
+	UseRRFFusion bool
 }
 
 type resolvedWeights struct {
@@ -89,6 +94,12 @@ type resolvedWeights struct {
 	UseACTR      bool
 	ACTRDecay    float64 // power-law decay exponent d (default 0.5 per Anderson 1993)
 	ACTRHebScale float64 // Hebbian scaling factor inside softplus (default 4.0)
+
+	// RRF fusion: when UseRRFFusion=true, Phase 6 uses the Phase 3 RRF score
+	// directly as the scoring basis. Cognitive boosts (Hebbian, transition,
+	// confidence) are applied multiplicatively after fusion.
+	// This is rank-based and scale-invariant — robust to score scale mismatches.
+	UseRRFFusion bool
 }
 
 // Filter is a query filter applied in Phase 6.
@@ -129,6 +140,12 @@ type ScoredEngram struct {
 	Dormant     bool
 }
 
+// EngramFilter is a post-retrieval predicate applied as the final activation step.
+// Implemented by *query.Filter; any caller can implement this for custom filtering.
+type EngramFilter interface {
+	Match(*storage.Engram) bool
+}
+
 // ActivateRequest is the internal activation request form.
 type ActivateRequest struct {
 	VaultID          uint32
@@ -144,13 +161,16 @@ type ActivateRequest struct {
 	ReadOnly         bool   // when true, skip all write side-effects (observe mode)
 	Profile          string // traversal profile override: "default"|"causal"|"confirmatory"|"adversarial"|"structural"
 	VaultDefault     string // vault Plasticity default profile (set by engine.go, not by callers)
-	StructuredFilter interface{} // *query.Filter, applied as final post-retrieval predicate
+	StructuredFilter EngramFilter // applied as final post-retrieval predicate
 	// CandidatesPerIndex overrides the per-index candidate pool size for phase2.
 	// Zero means fall back to 30.
 	CandidatesPerIndex int
 	// PAS: Predictive Activation Signal — sequential transition tracking.
 	PASEnabled       bool // when true, inject transition candidates in Phase 2
 	PASMaxInjections int  // max transition candidates to inject (0 = default 5)
+	// ExcludeUntrusted: when true, engrams with TrustUntrusted (0x04) are silently
+	// excluded from activation results. Set by the engine from vault PlasticityConfig.
+	ExcludeUntrusted bool
 }
 
 // ActivateResult is what the transport layer serializes and returns.
@@ -354,6 +374,14 @@ func (e *ActivationEngine) Run(ctx context.Context, req *ActivateRequest) (*Acti
 	}
 	if req.Threshold <= 0 {
 		req.Threshold = 0.05
+	}
+
+	// After threshold default is set, adjust for RRF mode.
+	// RRF scores are typically in [0, 0.05] range -- much lower than ACT-R.
+	// Apply an RRF-appropriate threshold to avoid filtering all results.
+	w := resolveWeights(req.Weights, e.weights)
+	if w.UseRRFFusion && req.Threshold >= 0.01 {
+		req.Threshold = 0.001
 	}
 
 	// Phase 1: embed + tokenize
@@ -1054,6 +1082,14 @@ func (e *ActivationEngine) phase6Score(
 
 	w := resolveWeights(req.Weights, e.weights)
 
+	// Guard: RRF and CGDN are mutually exclusive scoring paths.
+	// If both are enabled, RRF takes precedence (checked first below).
+	// Log the conflict so operators can fix their plasticity config.
+	if w.UseRRFFusion && w.UseCGDN {
+		slog.Warn("scoring: both RRF and CGDN enabled -- RRF takes precedence, CGDN ignored")
+		w.UseCGDN = false
+	}
+
 	type scoringCandidate struct {
 		id              storage.ULID
 		ftsScore        float64
@@ -1063,6 +1099,7 @@ func (e *ActivationEngine) phase6Score(
 		rrfScore        float64
 		hopPath         []storage.ULID
 		relType         uint16
+		isTraversed     bool // true for BFS-only candidates; vectorScore is computed post-load
 	}
 
 	// Deduplicate: fused candidates take priority; traversed candidates are
@@ -1089,11 +1126,18 @@ func (e *ActivationEngine) phase6Score(
 			if _, dup := seen[t.id]; dup {
 				continue
 			}
+			// Route the BFS propagated score to both rrfScore (for RRF mode) and
+			// hebbianBoost (for ACT-R/CGDN spreading activation).
+			// rrfScore must be non-zero: RRF final = rrfScore × (1 + hebbianBoost + ...)
+			// so zero rrfScore silences traversed candidates in RRF mode at any threshold > 0.
+			// vectorScore is computed after engrams are loaded.
 			all = append(all, scoringCandidate{
-				id:       t.id,
-				rrfScore: t.propagated,
-				hopPath:  t.hopPath,
-				relType:  t.relType,
+				id:           t.id,
+				rrfScore:     t.propagated,
+				hebbianBoost: math.Min(t.propagated, 1.0),
+				hopPath:      t.hopPath,
+				relType:      t.relType,
+				isTraversed:  true,
 			})
 		}
 	}
@@ -1127,11 +1171,22 @@ func (e *ActivationEngine) phase6Score(
 	}
 
 	// Filter out soft-deleted engrams (defense-in-depth; HNSW has no delete method).
+	// Also filter untrusted engrams when ExcludeUntrusted is set in the request.
 	var active []*storage.Engram
 	for _, eng := range allEngrams {
-		if eng != nil && eng.State != storage.StateSoftDeleted {
-			active = append(active, eng)
+		if eng == nil {
+			continue
 		}
+		if eng.State == storage.StateSoftDeleted || eng.State == storage.StateArchived {
+			continue
+		}
+		// Hard trust filter: skip engrams with TrustUntrusted (0x04) when requested.
+		// TrustUnset (0x00) is intentionally passed through — it is the zero-value
+		// backward-compat alias for TrustInferred, not an "unknown" or untrusted value.
+		if req.ExcludeUntrusted && eng.Trust == storage.TrustUntrusted {
+			continue
+		}
+		active = append(active, eng)
 	}
 	allEngrams = active
 
@@ -1139,6 +1194,22 @@ func (e *ActivationEngine) phase6Score(
 	for _, eng := range allEngrams {
 		if eng != nil {
 			engramByID[eng.ID] = eng
+		}
+	}
+
+	// Compute vectorScore for BFS-traversed candidates now that engrams are loaded.
+	// Fused candidates already have vectorScore from the Phase 2 HNSW search.
+	// Traversed candidates get cosine similarity against the query embedding so that
+	// ACT-R/CGDN contentMatch is non-zero and the BFS spreading activation can take effect.
+	// ftsScore is left at zero: BM25 requires corpus-level IDF statistics unavailable here.
+	if len(p1.embedding) > 0 {
+		for i := range all {
+			if !all[i].isTraversed {
+				continue
+			}
+			if eng := engramByID[all[i].id]; eng != nil && len(eng.Embedding) > 0 {
+				all[i].vectorScore = float64(cosineSimilarity32(p1.embedding, eng.Embedding))
+			}
 		}
 	}
 
@@ -1151,6 +1222,42 @@ func (e *ActivationEngine) phase6Score(
 
 	now := time.Now()
 	scored := make([]scoredItem, 0, len(all))
+
+	// RRF fusion path: use Phase 3 RRF scores directly as the final score basis.
+	// Rank-based and scale-invariant (Cormack et al. 2009). Cognitive boosts
+	// (Hebbian, transition, confidence) are applied after fusion.
+	if w.UseRRFFusion {
+		for _, c := range all {
+			eng := engramByID[c.id]
+			if eng == nil || !passesMetaFilter(eng, req.Filters) {
+				continue
+			}
+			final := computeRRFScore(c.rrfScore, c.hebbianBoost, c.transitionBoost, eng)
+			if final < req.Threshold {
+				continue
+			}
+			// Populate ScoreComponents for observability: report the individual
+			// signal scores so callers can understand the composition even though
+			// the final score is rank-based.
+			normalizedFTS := math.Tanh(c.ftsScore)
+			scored = append(scored, scoredItem{
+				id:    c.id,
+				final: final,
+				components: ScoreComponents{
+					SemanticSimilarity: c.vectorScore,
+					FullTextRelevance:  normalizedFTS,
+					HebbianBoost:       c.hebbianBoost,
+					TransitionBoost:    c.transitionBoost,
+					Confidence:         float64(eng.Confidence),
+					Raw:                c.rrfScore * (1.0 + c.hebbianBoost + c.transitionBoost),
+					Final:              final,
+				},
+				hopPath: c.hopPath,
+			})
+		}
+		sort.Slice(scored, func(i, j int) bool { return scored[i].final > scored[j].final })
+		goto cgdnDone
+	}
 
 	// CGDN path: two-pass scoring with divisive normalization.
 	// Pass 1 computes gated activations a(d) for all candidates; Pass 2 normalizes.
@@ -1226,20 +1333,48 @@ func (e *ActivationEngine) phase6Score(
 		goto cgdnDone
 	}
 
-	// ACT-R path: single-pass, per-engram. No global normalization needed.
-	// Score = ContentMatch × softplus(BaseLevelActivation + scale×Hebbian + scale×Transition) × Confidence
+	// ACT-R path: two-pass with per-query normalization.
+	// Pass 1 collects raw scores; for fresh engrams softplus(B(M)) exceeds the
+	// median-activation denominator, so raw > 1.0. The old hard clamp at 1.0
+	// collapsed all saturated scores to the same value, destroying ranking in
+	// new vaults (issue #331). Pass 2 rescales by the query's max raw score
+	// when saturation occurred. For mature vaults where max raw ≤ 1.0 the
+	// scale factor is 1.0 — behaviour is identical to the old path.
 	if w.UseACTR {
+		type actrCandidate struct {
+			id         storage.ULID
+			components ScoreComponents
+			hopPath    []storage.ULID
+		}
+		actrCands := make([]actrCandidate, 0, len(all))
+		maxRaw := 0.0
 		for _, c := range all {
 			eng := engramByID[c.id]
 			if eng == nil || !passesMetaFilter(eng, req.Filters) {
 				continue
 			}
 			components := computeACTR(c.vectorScore, c.ftsScore, c.hebbianBoost, c.transitionBoost, eng, lastAccessNsByID[c.id], now, w)
-			final := components.Raw * components.Confidence
+			if components.Raw > maxRaw {
+				maxRaw = components.Raw
+			}
+			actrCands = append(actrCands, actrCandidate{id: c.id, components: components, hopPath: c.hopPath})
+		}
+		// Rescale all raw scores by 1/maxRaw when any candidate saturated above 1.0.
+		// This preserves the [0,1] contract and relative ranking without altering the
+		// formula for mature vaults where scores already spread below 1.0.
+		scale := 1.0
+		if maxRaw > 1.0 {
+			scale = 1.0 / maxRaw
+		}
+		for _, cc := range actrCands {
+			raw := math.Min(cc.components.Raw*scale, 1.0)
+			final := raw * cc.components.Confidence
 			if final < req.Threshold {
 				continue
 			}
-			scored = append(scored, scoredItem{id: c.id, final: final, components: components, hopPath: c.hopPath})
+			cc.components.Raw = raw
+			cc.components.Final = final
+			scored = append(scored, scoredItem{id: cc.id, final: final, components: cc.components, hopPath: cc.hopPath})
 		}
 		sort.Slice(scored, func(i, j int) bool { return scored[i].final > scored[j].final })
 		goto cgdnDone
@@ -1269,21 +1404,17 @@ cgdnDone:
 	// Apply structured filter if provided (post-retrieval predicate).
 	// This is applied AFTER RRF scoring and confidence checks, as the final step.
 	if req.StructuredFilter != nil {
-		if qf, ok := req.StructuredFilter.(interface {
-			Match(*storage.Engram) bool
-		}); ok {
-			filtered := make([]scoredItem, 0, len(scored))
-			for _, s := range scored {
-				eng := engramByID[s.id]
-				if eng == nil {
-					continue
-				}
-				if qf.Match(eng) {
-					filtered = append(filtered, s)
-				}
+		filtered := make([]scoredItem, 0, len(scored))
+		for _, s := range scored {
+			eng := engramByID[s.id]
+			if eng == nil {
+				continue
 			}
-			scored = filtered
+			if req.StructuredFilter.Match(eng) {
+				filtered = append(filtered, s)
+			}
 		}
+		scored = filtered
 	}
 
 	activations := make([]ScoredEngram, 0, len(scored))
@@ -1305,7 +1436,7 @@ cgdnDone:
 		}
 		var why string
 		if req.IncludeWhy {
-			why = buildWhy(eng, s.components, s.hopPath, hopConcepts, p1.queryStr)
+			why = buildWhy(eng, s.components, s.hopPath, hopConcepts, p1.queryStr, w.UseACTR)
 		}
 		activations = append(activations, ScoredEngram{
 			Engram:      eng,
@@ -1314,7 +1445,7 @@ cgdnDone:
 			Why:         why,
 			HopPath:     append([]storage.ULID(nil), s.hopPath...),
 			HopConcepts: hopConcepts,
-			Dormant:     eng.Relevance <= minFloor*1.1,
+			Dormant:     !w.UseACTR && eng.Relevance <= minFloor*1.1,
 		})
 	}
 
@@ -1400,9 +1531,37 @@ func softplus(x float64) float64 {
 	return math.Log1p(math.Exp(x))
 }
 
+// cosineSimilarity32 computes cosine similarity between two float32 vectors.
+// Returns 0 for empty or mismatched-length inputs.
+// Uses the same unrolled 4-wide dot product as the HNSW index for consistency.
+func cosineSimilarity32(a, b []float32) float32 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 0
+	}
+	var dot, na, nb float32
+	i := 0
+	for ; i+3 < len(a); i += 4 {
+		dot += a[i]*b[i] + a[i+1]*b[i+1] + a[i+2]*b[i+2] + a[i+3]*b[i+3]
+		na += a[i]*a[i] + a[i+1]*a[i+1] + a[i+2]*a[i+2] + a[i+3]*a[i+3]
+		nb += b[i]*b[i] + b[i+1]*b[i+1] + b[i+2]*b[i+2] + b[i+3]*b[i+3]
+	}
+	for ; i < len(a); i++ {
+		dot += a[i] * b[i]
+		na += a[i] * a[i]
+		nb += b[i] * b[i]
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (float32(math.Sqrt(float64(na))) * float32(math.Sqrt(float64(nb))))
+}
+
 // computeACTR computes the ACT-R scoring components for a candidate engram.
 // Formula (Anderson 1993):
-//   B(M) = ln(n+1) - d × ln(max(ageDays,ageFloor) / (n+1))   [base-level activation]
+//   B(M) = min(ln(n+1) - d × ln(max(ageDays,ageFloor) / (n+1)), bLevelCap)  [base-level activation]
+//   where bLevelCap = ln(exp(actrDenominator)-1) ≈ 1.489 is the unique value at which
+//   softplus(B(M)) = actrDenominator, i.e. base-level alone would push raw = contentMatch.
+//   Capping here preserves score absoluteness and threshold semantics across queries.
 //   Score = ContentMatch × softplus(B(M) + scale×Hebbian) × Confidence
 //
 // ContentMatch gates the score: zero semantic relevance = zero score regardless of recency.
@@ -1435,6 +1594,15 @@ func computeACTR(vectorScore, ftsScore, hebbianBoost, transitionBoost float64, e
 	n := float64(eng.AccessCount + 1) // +1 avoids ln(0) for never-accessed engrams
 	d := w.ACTRDecay                  // power-law forgetting exponent (default 0.5)
 	baseLevel := math.Log(n) - d*math.Log(math.Max(ageDays, ageFloorDays)/n)
+	// Cap baseLevel at the derived saturation threshold: the unique B(M) where
+	// softplus(B(M)) = actrDenominator, i.e. where raw = contentMatch (zero Hebbian).
+	// Above this, base-level alone exceeds the content-match gate — semantically wrong.
+	// Preserves score absoluteness: threshold=0.3 means the same in fresh and mature vaults.
+	// Hebbian boosts may still push totalActivation above the cap — that is intentional.
+	bLevelCap := math.Log(math.Exp(actrDenominator) - 1) // ≈ 1.489
+	if baseLevel > bLevelCap {
+		baseLevel = bLevelCap
+	}
 
 	// Total activation = base-level + scaled Hebbian boost + scaled transition boost.
 	// ACTRHebScale (default 4.0) amplifies both Hebbian and transition signals so
@@ -1447,11 +1615,10 @@ func computeACTR(vectorScore, ftsScore, hebbianBoost, transitionBoost float64, e
 
 	// Final raw score: ContentMatch gates contextual prior.
 	// Normalize by actrDenominator = 1 + softplus(0) ≈ 1.693 so that a median-activation
-	// memory with perfect content match produces raw ≈ 1.0. Clamp to [0, 1] for contract.
+	// memory with perfect content match produces raw ≈ 1.0. The upper bound is enforced
+	// after per-query normalization in the ACT-R scoring path (see caller) — not here —
+	// so the caller can see true relative magnitudes before rescaling.
 	raw := contentMatch * contextualPrior / actrDenominator
-	if raw > 1.0 {
-		raw = 1.0
-	}
 	if raw < 0.0 {
 		raw = 0.0
 	}
@@ -1469,6 +1636,32 @@ func computeACTR(vectorScore, ftsScore, hebbianBoost, transitionBoost float64, e
 		Raw:                raw,
 		Final:              raw * conf,
 	}
+}
+
+// computeRRFScore computes the final score for a candidate using the Phase 3
+// RRF score directly as the scoring basis (Cormack et al. 2009).
+//
+// Unlike ACT-R/CGDN/weighted-sum which recompute scores from individual signal
+// components, RRF fusion uses the rank-based score from Phase 3 and applies
+// cognitive modifiers after fusion:
+//
+//   raw = rrfScore × (1 + hebbianBoost + transitionBoost)
+//   final = raw × confidence
+//
+// This is scale-invariant: documents with the same ranks but different raw score
+// magnitudes produce the same RRF score. Robust to score scale mismatches between
+// BM25 (unbounded), HNSW cosine similarity [0,1], and graph traversal scores.
+//
+// Parameters match fusedCandidate fields so the function works with both
+// fusedCandidate (Phase 3 output) and scoringCandidate (Phase 6 local type).
+func computeRRFScore(rrfScore, hebbianBoost, transitionBoost float64, eng *storage.Engram) float64 {
+	// Cognitive boost: Hebbian and transition boosts amplify the RRF score.
+	// The (1 + boost) formulation ensures zero boost = no change, and positive
+	// boosts provide multiplicative amplification proportional to association strength.
+	cognitiveMultiplier := 1.0 + hebbianBoost + transitionBoost
+	raw := rrfScore * cognitiveMultiplier
+	conf := float64(eng.Confidence)
+	return raw * conf
 }
 
 // computeGatedActivation computes the raw gated activation a(d) for CGDN.
@@ -1564,6 +1757,7 @@ func resolveWeights(req *Weights, def DefaultWeights) resolvedWeights {
 		Recency:            float64(req.Recency),
 		UseCGDN:            req.UseCGDN,
 		UseACTR:            !req.DisableACTR,
+		UseRRFFusion:       req.UseRRFFusion,
 	}
 	// Apply CGDN defaults when enabled.
 	if req.UseCGDN {
@@ -1592,7 +1786,7 @@ func resolveWeights(req *Weights, def DefaultWeights) resolvedWeights {
 	return rw
 }
 
-func buildWhy(eng *storage.Engram, c ScoreComponents, hopPath []storage.ULID, hopConcepts []string, queryStr string) string {
+func buildWhy(eng *storage.Engram, c ScoreComponents, hopPath []storage.ULID, hopConcepts []string, queryStr string, useACTR bool) string {
 	var parts []string
 
 	signals := map[string]float64{
@@ -1642,7 +1836,7 @@ func buildWhy(eng *storage.Engram, c ScoreComponents, hopPath []storage.ULID, ho
 		parts = append(parts, fmt.Sprintf("confidence is low (%.0f%%)", c.Confidence*100))
 	}
 
-	if eng.Relevance <= minFloor*1.1 {
+	if !useACTR && eng.Relevance <= minFloor*1.1 {
 		parts = append(parts, "dormant (low decay relevance)")
 	}
 

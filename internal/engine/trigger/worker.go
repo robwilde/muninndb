@@ -167,6 +167,9 @@ func (w *TriggerWorker) handleCognitive(ctx context.Context, event CognitiveEven
 		return
 	}
 	meta := metas[0]
+	if meta == nil {
+		return
+	}
 
 	for _, sub := range subs {
 		sub.mu.Lock()
@@ -240,7 +243,7 @@ func (w *TriggerWorker) handleContradiction(ctx context.Context, event Contradic
 
 		for _, id := range []storage.ULID{event.EngramA, event.EngramB} {
 			eng := byID[id]
-			if eng == nil || eng.State == storage.StateSoftDeleted {
+			if eng == nil || eng.State == storage.StateSoftDeleted || eng.State == storage.StateArchived {
 				continue
 			}
 			w.deliver.Send(sub, &ActivationPush{
@@ -330,6 +333,9 @@ func (w *TriggerWorker) sweepVault(ctx context.Context, vaultID uint32, ws [8]by
 		}
 		metaByID := make(map[storage.ULID]*storage.EngramMeta, len(metas))
 		for _, m := range metas {
+			if m == nil {
+				continue
+			}
 			metaByID[m.ID] = m
 		}
 
@@ -355,7 +361,7 @@ func (w *TriggerWorker) sweepVault(ctx context.Context, vaultID uint32, ws [8]by
 		for _, sub := range group.subs {
 			for _, c := range candidates {
 				meta := metaByID[c.ID]
-				if meta == nil || meta.State == storage.StateSoftDeleted {
+				if meta == nil || meta.State == storage.StateSoftDeleted || meta.State == storage.StateArchived {
 					continue
 				}
 
@@ -378,7 +384,7 @@ func (w *TriggerWorker) sweepVault(ctx context.Context, vaultID uint32, ws [8]by
 				}
 
 				eng := engramByID[c.ID]
-				if eng == nil || eng.State == storage.StateSoftDeleted {
+				if eng == nil || eng.State == storage.StateSoftDeleted || eng.State == storage.StateArchived {
 					continue
 				}
 

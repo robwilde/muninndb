@@ -2,7 +2,6 @@ package rest
 
 import (
 	"context"
-	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -20,6 +19,8 @@ import (
 
 	"github.com/google/uuid"
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/oklog/ulid/v2"
+	"github.com/scrypster/muninndb/internal/audit"
 	"github.com/scrypster/muninndb/internal/auth"
 	"github.com/scrypster/muninndb/internal/config"
 	"github.com/scrypster/muninndb/internal/engine"
@@ -30,6 +31,17 @@ import (
 	mbp "github.com/scrypster/muninndb/internal/transport/mbp"
 	"golang.org/x/time/rate"
 )
+
+// isValidEngramID returns true if id is a syntactically valid ULID.
+// Used at REST handler boundaries to return 400 instead of 500 when a caller
+// passes a malformed ID (e.g. a word like "rebuild" in the URL path).
+func isValidEngramID(id string) bool {
+	// ParseStrict is intentionally used over Parse: it rejects Crockford-confusable
+	// characters (I→1, L→1, O→0) rather than silently remapping them, so callers
+	// must supply IDs exactly as the system issued them.
+	_, err := ulid.ParseStrict(id)
+	return err == nil
+}
 
 // ctxKeyRequestID is the typed context key used to propagate the request ID
 // through the middleware chain to sendError.
@@ -47,6 +59,16 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+// Flush implements http.Flusher so that long-lived handlers (e.g. SSE) receive
+// a Flusher-capable writer after passing through loggingMiddleware. Without this,
+// the w.(http.Flusher) type assertion in handleSubscribe always fails because
+// loggingMiddleware wraps w with statusRecorder before calling the handler.
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // Server is an HTTP REST server for the MuninnDB engine.
 type Server struct {
 	addr          string
@@ -59,11 +81,12 @@ type Server struct {
 	tlsConfig     *tls.Config // nil = plain TCP
 
 	// Embedder info — set at construction time, static for the lifetime of the server.
-	embedProvider string // "ollama", "openai", "voyage", or "none"
-	embedModel    string // model name, or "" if none
+	embedProvider            string // "ollama", "openai", "voyage", or "none"
+	embedModel               string // model name, or "" if none
+	embedHardwareAccelerated *bool  // nil for cloud/noop providers; true/false for Ollama
 
 	// Enrichment info — set at construction time, static for the lifetime of the server.
-	enrichProvider string // "ollama", "openai", "anthropic", or ""
+	enrichProvider string // "ollama", "openai", "anthropic", "google", or ""
 	enrichModel    string // model name, or ""
 
 	// MCP info — set at construction time for the /api/admin/mcp-info endpoint.
@@ -84,6 +107,8 @@ type Server struct {
 	// coordinator is the optional cluster coordinator; nil when cluster is disabled.
 	coordinator *replication.ClusterCoordinator
 
+	auditLog *audit.Logger
+
 	// Health check fields.
 	startTime       time.Time
 	version         string // set at construction time; empty falls back to "dev"
@@ -98,13 +123,14 @@ type Server struct {
 
 // EmbedInfo carries static embedder metadata set at server construction time.
 type EmbedInfo struct {
-	Provider string // "ollama", "openai", "voyage", or "none"
-	Model    string // model name, or ""
+	Provider            string // "ollama", "openai", "voyage", or "none"
+	Model               string // model name, or ""
+	HardwareAccelerated *bool  // nil for cloud/noop providers; true/false for Ollama
 }
 
 // EnrichInfo carries static enrichment metadata set at server construction time.
 type EnrichInfo struct {
-	Provider string // "ollama", "openai", "anthropic", or ""
+	Provider string // "ollama", "openai", "anthropic", "google", or ""
 	Model    string // model name, or ""
 }
 
@@ -122,22 +148,23 @@ type MCPInfo struct {
 func NewServer(addr string, engine EngineAPI, authStore *auth.Store, sessionSecret []byte, corsOrigins []string, embedInfo EmbedInfo, enrichInfo EnrichInfo, pluginRegistry *plugin.Registry, dataDir string, tlsConfig *tls.Config, mcpInfo ...MCPInfo) *Server {
 	mux := http.NewServeMux()
 	s := &Server{
-		addr:           addr,
-		engine:         engine,
-		authStore:      authStore,
-		sessionSecret:  sessionSecret,
-		corsOrigins:    corsOrigins,
-		mux:            mux,
-		embedProvider:  embedInfo.Provider,
-		embedModel:     embedInfo.Model,
-		enrichProvider: enrichInfo.Provider,
-		enrichModel:    enrichInfo.Model,
-		pluginRegistry: pluginRegistry,
-		dataDir:        dataDir,
-		tlsConfig:      tlsConfig,
-		startTime:      time.Now(),
-		shutdown:       make(chan struct{}),
-		ready:          make(chan struct{}),
+		addr:                     addr,
+		engine:                   engine,
+		authStore:                authStore,
+		sessionSecret:            sessionSecret,
+		corsOrigins:              corsOrigins,
+		mux:                      mux,
+		embedProvider:            embedInfo.Provider,
+		embedModel:               embedInfo.Model,
+		embedHardwareAccelerated: embedInfo.HardwareAccelerated,
+		enrichProvider:           enrichInfo.Provider,
+		enrichModel:              enrichInfo.Model,
+		pluginRegistry:           pluginRegistry,
+		dataDir:                  dataDir,
+		tlsConfig:                tlsConfig,
+		startTime:                time.Now(),
+		shutdown:                 make(chan struct{}),
+		ready:                    make(chan struct{}),
 	}
 	// Subsystems are considered ready immediately unless explicitly marked otherwise.
 	s.subsystemsReady.Store(true)
@@ -168,12 +195,12 @@ func NewServer(addr string, engine EngineAPI, authStore *auth.Store, sessionSecr
 	mux.HandleFunc("GET /api/workers", s.withPublicMiddleware(s.handleWorkerStats))
 
 	// Authenticated vault routes — require Bearer API key.
-	mux.HandleFunc("POST /api/engrams/batch", s.withMiddleware(s.handleBatchCreate))
-	mux.HandleFunc("POST /api/engrams", s.withMiddleware(s.handleCreateEngram))
+	mux.HandleFunc("POST /api/engrams/batch", s.withMiddleware(auth.ReadOnlyGuard(s.handleBatchCreate)))
+	mux.HandleFunc("POST /api/engrams", s.withMiddleware(auth.ReadOnlyGuard(s.handleCreateEngram)))
 	mux.HandleFunc("GET /api/engrams/{id}", s.withMiddleware(auth.WriteOnlyGuard(s.handleGetEngram)))
-	mux.HandleFunc("DELETE /api/engrams/{id}", s.withMiddleware(s.handleDeleteEngram))
+	mux.HandleFunc("DELETE /api/engrams/{id}", s.withMiddleware(auth.ReadOnlyGuard(s.handleDeleteEngram)))
 	mux.HandleFunc("POST /api/activate", s.withMiddleware(auth.WriteOnlyGuard(s.handleActivate)))
-	mux.HandleFunc("POST /api/link", s.withMiddleware(s.handleLink))
+	mux.HandleFunc("POST /api/link", s.withMiddleware(auth.ReadOnlyGuard(s.handleLink)))
 	mux.HandleFunc("GET /api/stats", s.withMiddleware(auth.WriteOnlyGuard(s.handleStats)))
 	mux.HandleFunc("GET /api/engrams", s.withMiddleware(auth.WriteOnlyGuard(s.handleListEngrams)))
 	mux.HandleFunc("GET /api/engrams/{id}/links", s.withMiddleware(auth.WriteOnlyGuard(s.handleGetEngramLinks)))
@@ -181,6 +208,7 @@ func NewServer(addr string, engine EngineAPI, authStore *auth.Store, sessionSecr
 	mux.HandleFunc("GET /api/vaults", s.withMiddleware(auth.WriteOnlyGuard(s.handleListVaults)))
 	mux.HandleFunc("GET /api/vaults/stats", s.withAdminMiddleware(s.handleVaultStats()))
 	mux.HandleFunc("GET /api/session", s.withMiddleware(auth.WriteOnlyGuard(s.handleGetSession)))
+	mux.HandleFunc("GET /api/activity-counts", s.withMiddleware(auth.WriteOnlyGuard(s.handleGetActivityCounts)))
 	// SSE subscribe — long-lived; bypasses write timeout via ResponseController.
 	mux.HandleFunc("GET /api/subscribe", s.withMiddleware(auth.WriteOnlyGuard(s.handleSubscribe)))
 
@@ -188,16 +216,16 @@ func NewServer(addr string, engine EngineAPI, authStore *auth.Store, sessionSecr
 	// These POST operations mutate existing engrams and return engram data in
 	// their response body — write-only keys must not be able to extract vault
 	// data via any response path.
-	mux.HandleFunc("POST /api/engrams/{id}/evolve", s.withMiddleware(auth.WriteOnlyGuard(s.handleEvolve)))
-	mux.HandleFunc("POST /api/consolidate", s.withMiddleware(auth.WriteOnlyGuard(s.handleConsolidateEngrams)))
-	mux.HandleFunc("POST /api/decide", s.withMiddleware(auth.WriteOnlyGuard(s.handleDecide)))
-	mux.HandleFunc("POST /api/engrams/{id}/restore", s.withMiddleware(auth.WriteOnlyGuard(s.handleRestore)))
+	mux.HandleFunc("POST /api/engrams/{id}/evolve", s.withMiddleware(auth.ReadOnlyGuard(auth.WriteOnlyGuard(s.handleEvolve))))
+	mux.HandleFunc("POST /api/consolidate", s.withMiddleware(auth.ReadOnlyGuard(auth.WriteOnlyGuard(s.handleConsolidateEngrams))))
+	mux.HandleFunc("POST /api/decide", s.withMiddleware(auth.ReadOnlyGuard(auth.WriteOnlyGuard(s.handleDecide))))
+	mux.HandleFunc("POST /api/engrams/{id}/restore", s.withMiddleware(auth.ReadOnlyGuard(auth.WriteOnlyGuard(s.handleRestore))))
 	mux.HandleFunc("POST /api/traverse", s.withMiddleware(auth.WriteOnlyGuard(s.handleTraverse)))
 	mux.HandleFunc("POST /api/explain", s.withMiddleware(auth.WriteOnlyGuard(s.handleExplain)))
-	mux.HandleFunc("PUT /api/engrams/{id}/state", s.withMiddleware(s.handleSetState))
-	mux.HandleFunc("PUT /api/engrams/{id}/tags", s.withMiddleware(s.handleUpdateTags))
+	mux.HandleFunc("PUT /api/engrams/{id}/state", s.withMiddleware(auth.ReadOnlyGuard(auth.WriteOnlyGuard(s.handleSetState))))
+	mux.HandleFunc("PUT /api/engrams/{id}/tags", s.withMiddleware(auth.ReadOnlyGuard(auth.WriteOnlyGuard(s.handleUpdateTags))))
 	mux.HandleFunc("GET /api/deleted", s.withMiddleware(auth.WriteOnlyGuard(s.handleListDeleted)))
-	mux.HandleFunc("POST /api/engrams/{id}/retry-enrich", s.withMiddleware(auth.WriteOnlyGuard(s.handleRetryEnrich)))
+	mux.HandleFunc("POST /api/engrams/{id}/retry-enrich", s.withMiddleware(auth.ReadOnlyGuard(auth.WriteOnlyGuard(s.handleRetryEnrich))))
 	mux.HandleFunc("GET /api/contradictions", s.withMiddleware(auth.WriteOnlyGuard(s.handleContradictions)))
 	mux.HandleFunc("GET /api/guide", s.withMiddleware(auth.WriteOnlyGuard(s.handleGuide)))
 
@@ -222,7 +250,7 @@ func NewServer(addr string, engine EngineAPI, authStore *auth.Store, sessionSecr
 	mux.HandleFunc("GET /api/admin/vaults/{name}/job-status", s.withAdminMiddleware(s.handleVaultJobStatus))
 	mux.HandleFunc("GET /api/admin/vaults/{name}/export", s.withAdminMiddleware(s.handleExportVault))
 	mux.HandleFunc("GET /api/admin/vaults/{name}/export-markdown", s.withAdminMiddleware(s.handleExportVaultMarkdown))
-	mux.HandleFunc("POST /api/admin/vaults/import", s.withAdminMiddleware(s.withLargeBody(s.handleImportVault)))
+	mux.HandleFunc("POST /api/admin/vaults/import", s.withAdminMiddlewareNoSizeLimit(s.withLargeBody(s.handleImportVault)))
 	mux.HandleFunc("POST /api/admin/vaults/{name}/reindex-fts", s.withAdminMiddleware(s.handleReindexFTSVault))
 	mux.HandleFunc("POST /api/admin/vaults/{name}/reembed", s.withAdminMiddleware(s.handleReembedVault))
 	mux.HandleFunc("POST /api/admin/vaults/{name}/rename", s.withAdminMiddleware(s.handleRenameVault))
@@ -245,8 +273,18 @@ func NewServer(addr string, engine EngineAPI, authStore *auth.Store, sessionSecr
 	mux.HandleFunc("GET /api/admin/cluster/events", s.withAdminMiddleware(s.handleAdminClusterEvents))
 
 	// Build the global and per-IP rate limiters from env vars with fallback defaults.
-	globalRPS := envIntDefault("MUNINN_RATE_LIMIT_GLOBAL_RPS", 1000)
-	perIPRPS := envIntDefault("MUNINN_RATE_LIMIT_PER_IP_RPS", 100)
+	const defaultGlobalRPS = 1000
+	const defaultPerIPRPS = 100
+	globalRPS := envIntDefault("MUNINN_RATE_LIMIT_GLOBAL_RPS", defaultGlobalRPS)
+	if globalRPS <= 0 {
+		slog.Warn("MUNINN_RATE_LIMIT_GLOBAL_RPS is <= 0, using default", "value", globalRPS, "default", defaultGlobalRPS)
+		globalRPS = defaultGlobalRPS
+	}
+	perIPRPS := envIntDefault("MUNINN_RATE_LIMIT_PER_IP_RPS", defaultPerIPRPS)
+	if perIPRPS <= 0 {
+		slog.Warn("MUNINN_RATE_LIMIT_PER_IP_RPS is <= 0, using default", "value", perIPRPS, "default", defaultPerIPRPS)
+		perIPRPS = defaultPerIPRPS
+	}
 	globalLimiter := rate.NewLimiter(rate.Limit(globalRPS), globalRPS*2)
 	ipCache, _ := lru.New[string, *rate.Limiter](50_000)
 
@@ -260,6 +298,50 @@ func NewServer(addr string, engine EngineAPI, authStore *auth.Store, sessionSecr
 	}
 
 	return s
+}
+
+// SetAuditLogger attaches an audit.Logger to the server. Must be called before
+// Serve. Safe to call with nil (disables audit logging).
+func (s *Server) SetAuditLogger(l *audit.Logger) {
+	s.auditLog = l
+}
+
+// EmitAudit records a single admin action. No-op when no audit logger is configured.
+// Exported so it can be called from tests and UI server wrappers.
+func (s *Server) EmitAudit(r *http.Request, action, targetType, targetID, result string, meta map[string]string) {
+	if s.auditLog == nil {
+		return
+	}
+	e := audit.AuditEvent{
+		Timestamp:  time.Now().UTC(),
+		EventID:    ulid.Make().String(),
+		ActorType:  "admin",
+		ActorID:    "admin",
+		Action:     action,
+		TargetType: targetType,
+		TargetID:   targetID,
+		Result:     result,
+		ClientIP:   r.RemoteAddr,
+		Metadata:   meta,
+	}
+	if rid, ok := r.Context().Value(ctxKeyRequestID{}).(string); ok {
+		e.RequestID = rid
+	}
+	s.auditLog.Log(e)
+}
+
+// emitAuditErr is the error-path variant. Sets Result "error" and captures err.Error().
+func (s *Server) emitAuditErr(r *http.Request, action, targetType, targetID string, err error, meta map[string]string) {
+	result := "ok"
+	if err != nil {
+		result = "error"
+		if meta == nil {
+			meta = map[string]string{"error": err.Error()}
+		} else {
+			meta["error"] = err.Error()
+		}
+	}
+	s.EmitAudit(r, action, targetType, targetID, result, meta)
 }
 
 // Handler returns the HTTP handler for the REST API, so it can be mounted on another mux.
@@ -333,6 +415,14 @@ func (s *Server) enableClusterRuntime(ctx context.Context, cfg config.ClusterCon
 		if err := config.SaveClusterConfig(s.dataDir, cfg); err != nil {
 			return fmt.Errorf("persist config: %w", err)
 		}
+		// Reload after saving so auto-generated fields (NodeID) are populated
+		// before the coordinator is created. Without this, the coordinator
+		// starts with an empty NodeID and the node cannot rejoin after restart.
+		reloaded, err := config.LoadClusterConfig(s.dataDir)
+		if err != nil {
+			return fmt.Errorf("reload config after save: %w", err)
+		}
+		cfg = reloaded
 	}
 	if s.coordinatorFactory != nil {
 		coord, err := s.coordinatorFactory(ctx, cfg)
@@ -492,6 +582,18 @@ func (s *Server) withAdminMiddleware(handler http.HandlerFunc) http.HandlerFunc 
 	return s.withPublicMiddleware(s.bodySizeMiddleware(s.authStore.AdminAPIMiddleware(s.sessionSecret, handler)))
 }
 
+// withAdminMiddlewareNoSizeLimit is like withAdminMiddleware but omits all body
+// size limits (both the 64 KB publicBodySizeMiddleware in withPublicMiddleware
+// and the 4 MB bodySizeMiddleware). Use this for routes that apply their own
+// limit (e.g. withLargeBody) so multiple MaxBytesReader wrappers don't compound.
+func (s *Server) withAdminMiddlewareNoSizeLimit(handler http.HandlerFunc) http.HandlerFunc {
+	if s.authStore == nil || len(s.sessionSecret) == 0 {
+		return s.recoveryMiddleware(s.requestIDMiddleware(s.loggingMiddleware(handler)))
+	}
+	return s.recoveryMiddleware(s.requestIDMiddleware(s.loggingMiddleware(
+		s.authStore.AdminAPIMiddleware(s.sessionSecret, handler))))
+}
+
 // bodySizeMiddleware limits request bodies to 4 MB to prevent resource exhaustion.
 func (s *Server) bodySizeMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	const maxBody = 4 << 20 // 4 MB
@@ -592,6 +694,14 @@ func (s *Server) handleCreateEngram(w http.ResponseWriter, r *http.Request) {
 	req.Vault = vault
 	resp, err := s.engine.Write(r.Context(), &req)
 	if err != nil {
+		if errors.Is(err, engine.ErrInvalidID) {
+			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, err.Error())
+			return
+		}
+		if errors.Is(err, engine.ErrInvalidRequest) {
+			s.sendError(r, w, http.StatusUnprocessableEntity, ErrInvalidEngram, err.Error())
+			return
+		}
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
@@ -652,9 +762,17 @@ func (s *Server) handleGetEngram(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "missing engram id")
 		return
 	}
+	if !isValidEngramID(id) {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid engram id format")
+		return
+	}
 	resp, err := s.engine.Read(r.Context(), &ReadRequest{ID: id, Vault: ctxVault(r)})
 	if err != nil {
-		s.sendError(r, w, http.StatusNotFound, ErrEngramNotFound, err.Error())
+		if errors.Is(err, engine.ErrEngramNotFound) {
+			s.sendError(r, w, http.StatusNotFound, ErrEngramNotFound, err.Error())
+		} else {
+			s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
+		}
 		return
 	}
 	s.sendJSON(w, http.StatusOK, resp)
@@ -666,9 +784,17 @@ func (s *Server) handleDeleteEngram(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "missing engram id")
 		return
 	}
+	if !isValidEngramID(id) {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid engram id format")
+		return
+	}
 	resp, err := s.engine.Forget(r.Context(), &ForgetRequest{ID: id, Vault: ctxVault(r)})
 	if err != nil {
-		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
+		if errors.Is(err, engine.ErrEngramNotFound) {
+			s.sendError(r, w, http.StatusNotFound, ErrEngramNotFound, err.Error())
+		} else {
+			s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
+		}
 		return
 	}
 	s.sendJSON(w, http.StatusOK, resp)
@@ -768,6 +894,10 @@ func (s *Server) handleLink(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := s.engine.Link(r.Context(), mbpReq)
 	if err != nil {
+		if errors.Is(err, engine.ErrInvalidID) {
+			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, err.Error())
+			return
+		}
 		if errors.Is(err, engine.ErrEngramNotFound) {
 			s.sendError(r, w, http.StatusNotFound, ErrEngramNotFound, err.Error())
 			return
@@ -1026,17 +1156,15 @@ func withClusterAuth(secret string, clusterActive bool) func(http.Handler) http.
 				return
 			}
 
-			// Extract Bearer token.
-			authHeader := r.Header.Get("Authorization")
-			const prefix = "Bearer "
-			if !strings.HasPrefix(authHeader, prefix) {
+			// Extract and validate Bearer token. auth.ValidateStaticToken enforces
+			// a length cap before the constant-time compare to prevent DoS via
+			// large Authorization header allocations.
+			token, found := auth.ParseBearerToken(r.Header.Get("Authorization"))
+			if !found {
 				writeError(w, http.StatusUnauthorized, "cluster_auth_required", "cluster authorization required")
 				return
 			}
-			token := authHeader[len(prefix):]
-
-			// Constant-time comparison to prevent timing attacks.
-			if subtle.ConstantTimeCompare([]byte(token), []byte(secret)) != 1 {
+			if !auth.ValidateStaticToken(token, secret) {
 				writeError(w, http.StatusUnauthorized, "cluster_auth_failed", "invalid cluster token")
 				return
 			}
@@ -1066,8 +1194,10 @@ func (s *Server) handleListEngrams(w http.ResponseWriter, r *http.Request) {
 	vault := ctxVault(r)
 
 	limit, _ := strconv.Atoi(q.Get("limit"))
-	if limit <= 0 || limit > 100 {
-		limit = 20
+	if limit <= 0 {
+		limit = 50
+	} else if limit > 200 {
+		limit = 200
 	}
 	offset, _ := strconv.Atoi(q.Get("offset"))
 	if offset < 0 {
@@ -1133,6 +1263,10 @@ func (s *Server) handleGetEngramLinks(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
 		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "missing engram id")
+		return
+	}
+	if !isValidEngramID(id) {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid engram id format")
 		return
 	}
 	vault := ctxVault(r)
@@ -1258,10 +1392,61 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	s.sendJSON(w, http.StatusOK, resp)
 }
 
+func (s *Server) handleGetActivityCounts(w http.ResponseWriter, r *http.Request) {
+	vault := ctxVault(r)
+
+	// Validate days parameter — reject malformed input.
+	daysStr := r.URL.Query().Get("days")
+	days := 7
+	if daysStr != "" {
+		d, err := strconv.Atoi(daysStr)
+		if err != nil {
+			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid 'days' parameter: must be an integer")
+			return
+		}
+		if d < 1 || d > 180 {
+			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid 'days' parameter: must be between 1 and 180")
+			return
+		}
+		days = d
+	}
+
+	// Validate until parameter — reject malformed input, normalize to UTC end-of-day.
+	untilStr := r.URL.Query().Get("until")
+	var until time.Time
+	if untilStr != "" {
+		t, err := time.Parse("2006-01-02", untilStr)
+		if err != nil {
+			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid 'until' parameter: expected YYYY-MM-DD format")
+			return
+		}
+		// End of that UTC day (ms-precision to match ULID granularity).
+		until = time.Date(t.Year(), t.Month(), t.Day(), 23, 59, 59, 999000000, time.UTC)
+	} else {
+		// Default: end of today in UTC.
+		now := time.Now().UTC()
+		until = time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 999000000, time.UTC)
+	}
+
+	// since = start of the first day in the window (UTC 00:00:00.000).
+	since := time.Date(until.Year(), until.Month(), until.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -(days - 1))
+
+	resp, err := s.engine.GetActivityCounts(r.Context(), &ActivityCountsRequest{Vault: vault, Since: since, Until: until})
+	if err != nil {
+		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
+		return
+	}
+	s.sendJSON(w, http.StatusOK, resp)
+}
+
 func (s *Server) handleEvolve(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
 		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "missing engram id")
+		return
+	}
+	if !isValidEngramID(id) {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid engram id format")
 		return
 	}
 	var body struct {
@@ -1344,9 +1529,17 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "missing engram id")
 		return
 	}
+	if !isValidEngramID(id) {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid engram id format")
+		return
+	}
 	resp, err := s.engine.Restore(r.Context(), ctxVault(r), id)
 	if err != nil {
-		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
+		if errors.Is(err, engine.ErrEngramNotFound) {
+			s.sendError(r, w, http.StatusNotFound, ErrEngramNotFound, err.Error())
+		} else {
+			s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
+		}
 		return
 	}
 	s.sendJSON(w, http.StatusOK, resp)
@@ -1416,6 +1609,10 @@ func (s *Server) handleSetState(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "missing engram id")
 		return
 	}
+	if !isValidEngramID(id) {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid engram id format")
+		return
+	}
 	var body SetStateRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid request body")
@@ -1450,6 +1647,10 @@ func (s *Server) handleUpdateTags(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
 		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "missing engram id")
+		return
+	}
+	if !isValidEngramID(id) {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid engram id format")
 		return
 	}
 	var body UpdateTagsRequest
@@ -1498,6 +1699,10 @@ func (s *Server) handleRetryEnrich(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "missing engram id")
 		return
 	}
+	if !isValidEngramID(id) {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid engram id format")
+		return
+	}
 	resp, err := s.engine.RetryEnrich(r.Context(), ctxVault(r), id)
 	if err != nil {
 		s.sendError(r, w, http.StatusInternalServerError, ErrEnrichmentError, err.Error())
@@ -1525,15 +1730,13 @@ func (s *Server) handleResolveContradiction(w http.ResponseWriter, r *http.Reque
 		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "id_a and id_b are required")
 		return
 	}
-	vault := req.Vault
-	if vault == "" {
-		vault = ctxVault(r)
-	}
+	vault := ctxVault(r)
 	if err := s.engine.ResolveContradiction(r.Context(), vault, req.IDA, req.IDB); err != nil {
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
 	s.sendJSON(w, http.StatusOK, ResolveContradictionResponse{Resolved: true})
+	s.EmitAudit(r, "contradiction.resolve", "vault", vault, "ok", nil)
 }
 
 func (s *Server) handleGuide(w http.ResponseWriter, r *http.Request) {

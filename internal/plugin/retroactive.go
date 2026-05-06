@@ -10,7 +10,15 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/scrypster/muninndb/internal/engine/circuit"
 )
+
+// errLLMFailed is an unexported sentinel wrapping errors that originate from
+// the LLM call itself (bad output, nil result, parse error). It signals a
+// permanent failure for the engram — distinct from transient failures (circuit
+// open, context cancelled) and storage errors (persistence after a successful
+// LLM call). Only the enrich path uses this sentinel.
+var errLLMFailed = errors.New("enrich: llm call failed")
 
 // pollInterval is how often the processor checks for newly written, unembedded engrams.
 const pollInterval = 3 * time.Second
@@ -93,6 +101,11 @@ func (rp *RetroactiveProcessor) Stats() RetroactiveStats {
 	return rp.stats
 }
 
+// Plugin returns the plugin associated with this processor.
+func (p *RetroactiveProcessor) Plugin() Plugin {
+	return p.plugin
+}
+
 // Mode returns "embed" when this processor handles embedding (DigestEmbed flag)
 // or "enrich" when it handles enrichment (DigestEnrich flag).
 func (rp *RetroactiveProcessor) Mode() string {
@@ -103,12 +116,13 @@ func (rp *RetroactiveProcessor) Mode() string {
 }
 
 // skipFlags returns the digest flags that should be excluded from scanning.
-// Embed processors skip DigestEmbedFailed engrams to avoid infinite retry loops.
+// Both embed and enrich processors skip permanently-failed engrams to prevent
+// infinite retry loops that trip the circuit breaker and block other memories.
 func (rp *RetroactiveProcessor) skipFlags() uint8 {
 	if rp.flagBit == DigestEmbed {
 		return DigestEmbedFailed
 	}
-	return 0
+	return DigestEnrichFailed
 }
 
 func (rp *RetroactiveProcessor) run(ctx context.Context) {
@@ -222,6 +236,13 @@ func (rp *RetroactiveProcessor) backoff(ctx context.Context, consecutiveErrors i
 // inference call per micro-batch, then scatters vectors back individually.
 // For EnrichPlugin: processes one engram at a time (LLM call per engram).
 func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
+	// Reset rate/ETA at the start of every pass so stale values from a prior
+	// pass don't leak into the embed-status API response while the processor is idle.
+	rp.statsMu.Lock()
+	rp.stats.RatePerSec = 0
+	rp.stats.ETASeconds = 0
+	rp.statsMu.Unlock()
+
 	skipFlags := rp.skipFlags()
 	total, err := rp.store.CountWithoutFlag(ctx, rp.flagBit, skipFlags)
 	if err != nil {
@@ -325,30 +346,39 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 			}
 			rp.statsMu.Lock()
 			rp.stats.Processed++
-			processed := rp.stats.Processed
 			rp.statsMu.Unlock()
+		}
+		microEngrams = microEngrams[:0]
+		microTexts = microTexts[:0]
 
-			if processed%1000 == 0 {
-				elapsed := time.Since(startTime).Seconds()
-				if elapsed > 0 {
-					rate := float64(processed) / elapsed
-					remaining := total - processed
-					etaSeconds := int64(float64(remaining) / rate)
-					rp.statsMu.Lock()
-					rp.stats.RatePerSec = rate
-					rp.stats.ETASeconds = etaSeconds
-					rp.statsMu.Unlock()
-					slog.Info("retroactive processor: progress",
+		// Rate/ETA fires after every micro-batch (not gated on %100 — always update).
+		// Use pass-local count (flushedProcessed - passStart) so rate reflects this
+		// pass's throughput, not the cumulative total across all passes.
+		// Log message fires only at 100-engram boundaries to avoid log spam.
+		rp.statsMu.RLock()
+		flushedProcessed := rp.stats.Processed
+		rp.statsMu.RUnlock()
+		passProcessedSoFar := flushedProcessed - passStart
+		if passProcessedSoFar > 0 {
+			elapsed := time.Since(startTime).Seconds()
+			if elapsed > 0 {
+				rate := float64(passProcessedSoFar) / elapsed
+				remaining := total - passProcessedSoFar
+				etaSeconds := int64(float64(remaining) / rate)
+				rp.statsMu.Lock()
+				rp.stats.RatePerSec = rate
+				rp.stats.ETASeconds = etaSeconds
+				rp.statsMu.Unlock()
+				if passProcessedSoFar%100 == 0 {
+					slog.Info("retroactive: progress",
 						"plugin", rp.plugin.Name(),
-						"processed", processed,
+						"processed", flushedProcessed,
 						"total", total,
 						"rate_per_sec", rate,
 						"eta_seconds", etaSeconds)
 				}
 			}
 		}
-		microEngrams = microEngrams[:0]
-		microTexts = microTexts[:0]
 	}
 
 	for iter.Next() {
@@ -387,7 +417,25 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 		}
 
 		// Non-embed (enrich) path: one-at-a-time as before.
-		if err := rp.processEngram(ctx, eng); err != nil {
+		if err := rp.processEnrichEngram(ctx, eng); err != nil {
+			if errors.Is(err, ErrNothingToEnrich) {
+				// Nothing to enrich is not a failure — mark the engram as
+				// enrichment-complete so it is not retried on the next scan.
+				slog.Debug("retroactive processor: nothing to enrich, marking complete",
+					"plugin", rp.plugin.Name(),
+					"engram_id", eng.ID.String())
+				if flagErr := rp.store.SetDigestFlag(ctx, eng.ID, rp.flagBit); flagErr != nil {
+					slog.Warn("retroactive processor: failed to set digest flag after nothing-to-enrich",
+						"plugin", rp.plugin.Name(),
+						"engram_id", eng.ID.String(),
+						"error", flagErr)
+				}
+				rp.statsMu.Lock()
+				rp.stats.Processed++
+				rp.statsMu.Unlock()
+				batchCount++
+				continue
+			}
 			slog.Warn("retroactive processor: failed to process engram",
 				"plugin", rp.plugin.Name(),
 				"engram_id", eng.ID.String(),
@@ -395,6 +443,17 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 			rp.statsMu.Lock()
 			rp.stats.Errors++
 			rp.statsMu.Unlock()
+			// LLM-originated failures (bad output, parse error) are permanent for
+			// this engram. Mark DigestEnrichFailed so the processor does not retry
+			// it indefinitely, which would trip the circuit breaker and block
+			// enrichment for all other memories. Storage/persistence errors are NOT
+			// marked — they are transient and should be retried when storage recovers.
+			if errors.Is(err, errLLMFailed) {
+				if flagErr := rp.store.SetDigestFlag(ctx, eng.ID, DigestEnrichFailed); flagErr != nil {
+					slog.Warn("retroactive processor: failed to set DigestEnrichFailed",
+						"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(), "error", flagErr)
+				}
+			}
 			continue
 		}
 
@@ -420,11 +479,12 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 			runtime.Gosched()
 		}
 
-		if processed%1000 == 0 {
+		passProcessedSoFar := processed - passStart
+		if passProcessedSoFar%100 == 0 {
 			elapsed := time.Since(startTime).Seconds()
 			if elapsed > 0 {
-				rate := float64(processed) / elapsed
-				remaining := total - processed
+				rate := float64(passProcessedSoFar) / elapsed
+				remaining := total - passProcessedSoFar
 				etaSeconds := int64(float64(remaining) / rate)
 
 				rp.statsMu.Lock()
@@ -467,34 +527,7 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 	return true
 }
 
-func (rp *RetroactiveProcessor) processEngram(ctx context.Context, eng *Engram) error {
-	// Check if this is an embed plugin
-	if embed, ok := rp.plugin.(EmbedPlugin); ok {
-		// Call Embed with the concept and content
-		text := eng.Concept + " " + eng.Content
-		vec, err := embed.Embed(ctx, []string{text})
-		if err != nil {
-			return err
-		}
-
-		// Store the embedding
-		if err := rp.store.UpdateEmbedding(ctx, eng.ID, vec); err != nil {
-			return err
-		}
-
-		// Insert into HNSW index
-		if err := rp.store.HNSWInsert(ctx, eng.ID, vec); err != nil {
-			return err
-		}
-
-		// Auto-link by embedding
-		if err := rp.store.AutoLinkByEmbedding(ctx, eng.ID, vec); err != nil {
-			return err
-		}
-
-		return nil
-	}
-
+func (rp *RetroactiveProcessor) processEnrichEngram(ctx context.Context, eng *Engram) error {
 	// Check if this is an enrich plugin
 	if enrich, ok := rp.plugin.(EnrichPlugin); ok {
 		// Read per-stage digest flags so we don't re-run stages the caller already provided.
@@ -522,10 +555,17 @@ func (rp *RetroactiveProcessor) processEngram(ctx context.Context, eng *Engram) 
 		// Call Enrich for missing fields.
 		result, err := enrich.Enrich(ctx, eng)
 		if err != nil {
-			return err
+			// Transient: circuit open, context cancelled/deadline exceeded.
+			// Do not wrap — the caller must not mark the engram as permanently failed.
+			if errors.Is(err, circuit.ErrOpen) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			// Permanent LLM failure (bad output, HTTP error, parse error).
+			// Wrap with errLLMFailed so the caller can mark DigestEnrichFailed.
+			return fmt.Errorf("%w: %v", errLLMFailed, err)
 		}
 		if result == nil {
-			return fmt.Errorf("enrich returned nil result")
+			return errLLMFailed
 		}
 
 		// Only overwrite fields the caller didn't provide.

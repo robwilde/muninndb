@@ -237,7 +237,7 @@ func TestGetEngram_EngineError_Boost(t *testing.T) {
 	eng := &readErrorEngine{}
 	server := NewServer("localhost:8080", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
-	req := httptest.NewRequest("GET", "/api/engrams/some-id", nil)
+	req := httptest.NewRequest("GET", "/api/engrams/" + testEngramID, nil)
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
 
@@ -250,7 +250,7 @@ func TestGetEngram_EngineError_Boost(t *testing.T) {
 type readErrorEngine struct{ MockEngine }
 
 func (e *readErrorEngine) Read(_ context.Context, _ *ReadRequest) (*ReadResponse, error) {
-	return nil, errors.New("not found")
+	return nil, engine.ErrEngramNotFound
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +382,29 @@ func (e *linkGenericErrorEngine) Link(_ context.Context, _ *mbp.LinkRequest) (*L
 	return nil, errors.New("generic link error")
 }
 
+type linkInvalidIDEngine struct{ MockEngine }
+
+func (e *linkInvalidIDEngine) Link(_ context.Context, _ *mbp.LinkRequest) (*LinkResponse, error) {
+	return nil, fmt.Errorf("%w: source_id %q: parse ulid: bad", engine.ErrInvalidID, "nonexistent-1")
+}
+
+func TestHandleLink_InvalidID_Returns400(t *testing.T) {
+	// Regression test for #395: invalid (non-ULID) source_id or target_id must
+	// return 400 Bad Request, not 500 Internal Server Error.
+	eng := &linkInvalidIDEngine{}
+	server := NewServer("localhost:8080", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
+
+	body := `{"source_id":"nonexistent-1","target_id":"nonexistent-2","rel_type":1}`
+	req := httptest.NewRequest("POST", "/api/link", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // ---------------------------------------------------------------------------
 // handleStats — error path (60% → better coverage)
 // ---------------------------------------------------------------------------
@@ -487,6 +510,29 @@ func (e *writeErrorEngine) Write(_ context.Context, _ *WriteRequest) (*WriteResp
 	return nil, errors.New("write failed")
 }
 
+type writeInvalidIDEngine struct{ MockEngine }
+
+func (e *writeInvalidIDEngine) Write(_ context.Context, _ *WriteRequest) (*WriteResponse, error) {
+	return nil, fmt.Errorf("%w: association target_id %q: parse ulid: bad", engine.ErrInvalidID, "not-a-ulid")
+}
+
+func TestCreateEngram_InvalidAssociationTargetID_Returns400(t *testing.T) {
+	// Regression test for #399: invalid target_id in inline associations must return
+	// 400 Bad Request, not 500 Internal Server Error.
+	eng := &writeInvalidIDEngine{}
+	server := NewServer("localhost:8080", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
+
+	body := `{"concept":"test","content":"test","associations":[{"target_id":"not-a-ulid","rel_type":1}]}`
+	req := httptest.NewRequest("POST", "/api/engrams", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for invalid association target_id, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // ---------------------------------------------------------------------------
 // handleEvolve — error paths (75%)
 // ---------------------------------------------------------------------------
@@ -495,7 +541,7 @@ func TestEvolveEndpoint_InvalidJSON(t *testing.T) {
 	eng := &MockEngine{}
 	server := NewServer("localhost:8080", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
-	req := httptest.NewRequest("POST", "/api/engrams/test-id/evolve", strings.NewReader("{bad json"))
+	req := httptest.NewRequest("POST", "/api/engrams/" + testEngramID + "/evolve", strings.NewReader("{bad json"))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
@@ -510,7 +556,7 @@ func TestEvolveEndpoint_EngineError(t *testing.T) {
 	server := NewServer("localhost:8080", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
 	body := `{"new_content":"updated","reason":"fix"}`
-	req := httptest.NewRequest("POST", "/api/engrams/test-id/evolve", strings.NewReader(body))
+	req := httptest.NewRequest("POST", "/api/engrams/" + testEngramID + "/evolve", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
@@ -649,7 +695,7 @@ func TestRestoreEndpoint_EngineError(t *testing.T) {
 	eng := &restoreErrorEngine{}
 	server := NewServer("localhost:8080", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
-	req := httptest.NewRequest("POST", "/api/engrams/missing-id/restore", nil)
+	req := httptest.NewRequest("POST", "/api/engrams/"+testEngramID+"/restore", nil)
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
 
@@ -766,7 +812,7 @@ func TestSetStateEndpoint_InvalidJSON(t *testing.T) {
 	eng := &MockEngine{}
 	server := NewServer("localhost:8080", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
-	req := httptest.NewRequest("PUT", "/api/engrams/test-id/state", strings.NewReader("{bad"))
+	req := httptest.NewRequest("PUT", "/api/engrams/" + testEngramID + "/state", strings.NewReader("{bad"))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
@@ -781,7 +827,7 @@ func TestSetStateEndpoint_EngineError(t *testing.T) {
 	server := NewServer("localhost:8080", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
 	body := `{"state":"active"}`
-	req := httptest.NewRequest("PUT", "/api/engrams/test-id/state", strings.NewReader(body))
+	req := httptest.NewRequest("PUT", "/api/engrams/" + testEngramID + "/state", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
@@ -805,7 +851,7 @@ func TestRetryEnrichEndpoint_EngineError(t *testing.T) {
 	eng := &retryEnrichErrorEngine{}
 	server := NewServer("localhost:8080", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
-	req := httptest.NewRequest("POST", "/api/engrams/test-id/retry-enrich", nil)
+	req := httptest.NewRequest("POST", "/api/engrams/" + testEngramID + "/retry-enrich", nil)
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
 
@@ -864,7 +910,7 @@ func TestGetEngramLinks_EngineError(t *testing.T) {
 	eng := &engramLinksErrorEngine{}
 	server := NewServer("localhost:8080", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
-	req := httptest.NewRequest("GET", "/api/engrams/test-id/links", nil)
+	req := httptest.NewRequest("GET", "/api/engrams/" + testEngramID + "/links", nil)
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
 

@@ -36,6 +36,10 @@ type JSONRPCError struct {
 type AuthContext struct {
 	Token      string
 	Authorized bool
+	// Populated when authenticated via an mk_ vault API key (not the static mdb_ token).
+	Vault    string // vault the key is scoped to; empty for static-token auth
+	Mode     string // "full", "observe", or "write"; empty for static-token auth
+	IsAPIKey bool   // true when authed via an mk_ vault API key
 }
 
 // ToolDefinition is one entry in the tools/list response.
@@ -48,9 +52,10 @@ type ToolDefinition struct {
 // MCP domain types (used by EngineInterface and handlers)
 
 type WriteResult struct {
-	ID      string `json:"id"`
-	Concept string `json:"concept"`
-	Hint    string `json:"hint,omitempty"`
+	ID       string   `json:"id"`
+	Concept  string   `json:"concept"`
+	Hint     string   `json:"hint,omitempty"`
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 type Memory struct {
@@ -69,6 +74,38 @@ type Memory struct {
 	AccessCount uint32    `json:"access_count,omitempty"`
 	Relevance   float32   `json:"relevance,omitempty"`
 	SourceType  string    `json:"source_type,omitempty"`
+	Trust       string    `json:"trust,omitempty"` // "verified", "inferred", "external", "untrusted"
+
+	// Populated only by muninn_read (omitted from recall responses).
+	Entities            []ReadEntity    `json:"entities,omitempty"`
+	EntityRelationships []ReadEntityRel `json:"entity_relationships,omitempty"`
+
+	// Populated only by muninn_recall when annotate=true.
+	Annotations *MemoryAnnotations `json:"annotations,omitempty"`
+}
+
+// MemoryAnnotations contains contextual metadata about a recalled memory,
+// populated only when muninn_recall is called with annotate=true.
+type MemoryAnnotations struct {
+	Stale         bool     `json:"stale"`
+	StaleDays     float64  `json:"stale_days"`
+	ConflictsWith []string `json:"conflicts_with,omitempty"`
+	SupersededBy  string   `json:"superseded_by,omitempty"`
+	LastVerified  string   `json:"last_verified,omitempty"` // RFC3339
+}
+
+// ReadEntity is a named entity linked to a specific engram.
+type ReadEntity struct {
+	Name string `json:"name"`
+	Type string `json:"type,omitempty"`
+}
+
+// ReadEntityRel is an entity-to-entity relationship sourced from a specific engram.
+type ReadEntityRel struct {
+	FromEntity string  `json:"from_entity"`
+	ToEntity   string  `json:"to_entity"`
+	RelType    string  `json:"rel_type"`
+	Weight     float32 `json:"weight,omitempty"`
 }
 
 type ContradictionPair struct {
@@ -159,8 +196,9 @@ type TraversalEdge struct {
 
 // ExplainRequest defines the context for a score explanation.
 type ExplainRequest struct {
-	EngramID string
-	Query    []string
+	EngramID  string
+	Query     []string
+	Embedding []float32 // optional client-provided query embedding
 }
 
 // ExplainComponents holds the per-component score breakdown.
@@ -200,6 +238,65 @@ type RetryEnrichResult struct {
 	PluginsQueued   []string `json:"plugins_queued"`
 	AlreadyComplete []string `json:"already_complete"`
 	Note            string   `json:"note,omitempty"`
+}
+
+// EnrichmentCandidate is one memory returned for agent-managed enrichment.
+type EnrichmentCandidate struct {
+	ID            string          `json:"id"`
+	Concept       string          `json:"concept"`
+	Content       string          `json:"content"`
+	Summary       string          `json:"summary,omitempty"`
+	MemoryType    string          `json:"memory_type,omitempty"`
+	TypeLabel     string          `json:"type_label,omitempty"`
+	CreatedAt     string          `json:"created_at"`
+	UpdatedAt     string          `json:"updated_at"`
+	MissingStages []string        `json:"missing_stages"`
+	DigestFlags   map[string]bool `json:"digest_flags"`
+}
+
+// EnrichmentCandidatesResult is returned by muninn_get_enrichment_candidates.
+type EnrichmentCandidatesResult struct {
+	Items           []EnrichmentCandidate `json:"items"`
+	StagesRequested []string              `json:"stages_requested"`
+	Count           int                   `json:"count"`
+	NextCursor      string                `json:"next_cursor,omitempty"`
+}
+
+// ApplyEnrichmentEntity is one externally generated entity.
+type ApplyEnrichmentEntity struct {
+	Name       string  `json:"name"`
+	Type       string  `json:"type"`
+	Confidence float32 `json:"confidence,omitempty"`
+}
+
+// ApplyEnrichmentRelationship is one externally generated relationship.
+type ApplyEnrichmentRelationship struct {
+	FromEntity string  `json:"from_entity"`
+	ToEntity   string  `json:"to_entity"`
+	RelType    string  `json:"rel_type"`
+	Weight     float32 `json:"weight,omitempty"`
+}
+
+// ApplyEnrichmentRequest contains explicit enrichment output from an MCP agent.
+type ApplyEnrichmentRequest struct {
+	ID               string                      `json:"id"`
+	ExpectedUpdatedAt string                     `json:"expected_updated_at"`
+	Summary          string                      `json:"summary,omitempty"`
+	MemoryType       string                      `json:"memory_type,omitempty"`
+	TypeLabel        string                      `json:"type_label,omitempty"`
+	Entities         []ApplyEnrichmentEntity     `json:"entities,omitempty"`
+	Relationships    []ApplyEnrichmentRelationship `json:"relationships,omitempty"`
+	StagesCompleted  []string                    `json:"stages_completed,omitempty"`
+	Source           string                      `json:"source,omitempty"`
+}
+
+// ApplyEnrichmentResult is returned by muninn_apply_enrichment.
+type ApplyEnrichmentResult struct {
+	ID            string          `json:"id"`
+	Status        string          `json:"status"`
+	AppliedStages []string        `json:"applied_stages"`
+	UpdatedAt     string          `json:"updated_at"`
+	DigestFlags   map[string]bool `json:"digest_flags"`
 }
 
 // ── Tree types ────────────────────────────────────────────────────────────────
@@ -242,11 +339,12 @@ type RecallTreeResult struct {
 
 // AddChildRequest is the input for a single child node in muninn_add_child.
 type AddChildRequest struct {
-	Concept string   `json:"concept"`
-	Content string   `json:"content"`
-	Type    string   `json:"type,omitempty"`
-	Tags    []string `json:"tags,omitempty"`
-	Ordinal *int32   `json:"ordinal,omitempty"` // nil = append at end
+	Concept   string    `json:"concept"`
+	Content   string    `json:"content"`
+	Type      string    `json:"type,omitempty"`
+	Tags      []string  `json:"tags,omitempty"`
+	Ordinal   *int32    `json:"ordinal,omitempty"` // nil = append at end
+	Embedding []float32 `json:"embedding,omitempty"`
 }
 
 // AddChildResult is returned by AddChild.

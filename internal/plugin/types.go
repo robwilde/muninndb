@@ -1,6 +1,9 @@
 package plugin
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 // PluginTier identifies the tier level of a plugin.
 type PluginTier int
@@ -44,6 +47,11 @@ type ExtractedRelation struct {
 	Weight     float32 // 0.0-1.0 confidence in this relationship
 }
 
+// ErrNothingToEnrich is returned when all pipeline stages are skipped because
+// the engram already has inline data (e.g., Summary set by caller during Write).
+// This is distinct from a real failure where LLM/network errors caused stages to fail.
+var ErrNothingToEnrich = errors.New("enrich: nothing to enrich")
+
 // DigestFlags tracks which processing stages have been applied to an engram.
 // Stored in the ERF metadata Reserved section at offset 68 (first byte of Reserved).
 const (
@@ -61,6 +69,16 @@ const (
 	// Engrams with this flag are skipped by the embed retroactive processor so
 	// they are not retried indefinitely.
 	DigestEmbedFailed uint8 = 0x80
+
+	// DigestEnrichFailed is set when LLM enrichment permanently fails for an engram
+	// (e.g. the LLM returns unparseable output). Engrams with this flag are skipped
+	// by the enrich retroactive processor to prevent infinite retry loops that trip
+	// the circuit breaker and block enrichment for all other memories.
+	//
+	// Shares the same bit as DigestEmbedFailed (the flag byte is full). Either
+	// failure type marks the engram as permanently failed for automated processing.
+	// An operator can clear it via the admin API retry endpoint.
+	DigestEnrichFailed uint8 = DigestEmbedFailed
 )
 
 // PluginStatus represents the runtime state of a registered plugin.
@@ -82,4 +100,10 @@ type RetroactiveStats struct {
 	ETASeconds int64     `json:"eta_seconds"`
 	StartedAt  time.Time `json:"started_at"`
 	Errors     int64     `json:"errors"` // count of skipped engrams
+}
+
+// HardwareAwarePlugin is implemented by providers that can report
+// whether they are running with hardware acceleration (e.g., GPU).
+type HardwareAwarePlugin interface {
+	HardwareAccelerated() bool
 }

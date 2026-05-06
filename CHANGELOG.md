@@ -9,13 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.4.10] - 2026-04-02
+
+### Added
+- Dashboard activity panel overhaul: selectable timeframe presets (7d–180d, capped at 180 days), end-date picker, dynamic x-axis tick grouping based on chart width, and a raw data table toggle with copy-to-clipboard. Includes loading, error, and empty-state feedback.
+- `GET /api/activity-counts` endpoint returning per-day engram creation counts for a vault. Accepts `days` (1–180, default 7) and optional `until` (YYYY-MM-DD) query parameters. Malformed or out-of-range values return 400. Backed by an efficient ULID key-header scan with zero-filled contiguous day ranges.
+
+### Changed
+- Web UI: unified tab navigation across Memories, Graph, and Settings pages with a consistent bordered-tab style replacing the previous mix of underline, button, and pill patterns.
+- Public vault unauthenticated access now runs in `full` mode. Previously, requests to an open vault with no API key ran as `observe`, silently preventing cognitive-state writes. Public vaults are now genuinely open — callers get `full` access unless they present an explicit `observe` key.
+
 ### Fixed
+- Native `<select>` dropdowns unreadable in dark mode — `--bg-card` CSS variable was referenced but never defined; added it to both themes and added global select/option styling for proper dark/light rendering.
+- Sidebar nav items are now scrollable when viewport height is too small, keeping the logo and footer pinned.
+- Collapsed sidebar footer icons no longer overflow into the right border; icons render borderless when collapsed and bordered when expanded.
+- "New Vault" action moved from sidebar footer into the vault picker modal to reclaim vertical space for nav items.
+- Sidebar footer icons (theme toggle, keyboard shortcuts) replaced with consistent SVG icons matching the existing icon family.
+- Version label merged into the footer icon row instead of occupying its own line.
+- Sidebar footer padding and gaps tightened to maximize nav item visibility on short viewports.
+- Memories page search-mode segmented control (Balanced/Semantic/Recent/Deep) now matches adjacent button height and font size, includes dividers between options, and preserves padding when Alpine.js re-renders dynamic styles.
 - Enrich now accepts OpenAI-compatible JSON responses returned in `message.reasoning` when `message.content` is empty, including structured reasoning payloads.
 - Retry and retroactive enrichment now only mark entity and relationship stages complete after successful persistence, avoiding partial-state retries, nil-result crashes, and silent graph-write failures.
 - Entity and relationship response parsing now rejects nested wrapper keys like `meta.entities` / `meta.relationships` instead of treating them as valid empty results.
 - Vault-scoped REST routes now resolve non-default vaults consistently from authenticated request bodies as well as `?vault=`, and reject mismatched query/body vaults.
 - Vault-scoped REST routes are setup to deprecate vault passed in the body in a later release.
 - REST read responses now include `memory_type: 0` for fact-classified memories instead of omitting the field.
+- Observe-mode API keys now return `403` on semantically mutating REST and gRPC routes while preserving access to read-like POST endpoints such as activation, traversal, explanation, and batch link reads.
+- ACT-R scoring: `bLevelCap` prevents base-level saturation in fresh vaults; two-pass per-query normalization ensures scores stay in [0, 1] range.
+- Archived engrams (dream engine) now filtered at all retrieval points — query, find-by-entity, trigger worker sweeps.
+- Dormant flag now gated on `!UseACTR`; in ACT-R mode the flag is derived from activation score rather than the Ebbinghaus relevance field.
+- Web UI: form class consistency, segmented control hover state, uniform input/button sizing, memory filter bar density, page title branding, logs page full-width layout, observability view hash routing.
+- SSE keepalive uses spec-compliant comment frame (`: keepalive`) to prevent proxy idle timeouts.
+- Entity type allowlist expanded from 8 to 14 types; unknown types pass through without coercion.
+- Clipboard API guarded by secure-context check with `execCommand` fallback for HTTP installs.
+- Pebble `ErrNotFound` distinguished from other errors in embed migration path.
 
 ---
 
@@ -169,7 +198,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Comparison Links
 
-[Unreleased]: https://github.com/scrypster/muninndb/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/scrypster/muninndb/compare/v0.4.10...HEAD
+[0.4.10]: https://github.com/scrypster/muninndb/compare/v0.4.9-alpha...v0.4.10
 [0.2.6]: https://github.com/scrypster/muninndb/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/scrypster/muninndb/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/scrypster/muninndb/compare/v0.2.3...v0.2.4

@@ -17,6 +17,7 @@ type enableClusterRequest struct {
 	Role          string `json:"role"`
 	BindAddr      string `json:"bind_addr"`
 	ClusterSecret string `json:"cluster_secret"`
+	Secret        string `json:"secret"`      // alias for cluster_secret
 	CortexAddr    string `json:"cortex_addr"`
 }
 
@@ -95,6 +96,11 @@ func (s *Server) handleAdminClusterEnable(w http.ResponseWriter, r *http.Request
 		s.sendError(r, w, http.StatusBadRequest, ErrInvalidClusterRequest, "cortex_addr is required for non-primary roles")
 		return
 	}
+	// Accept "secret" as a convenience alias for "cluster_secret".
+	if req.ClusterSecret == "" {
+		req.ClusterSecret = req.Secret
+	}
+
 	// Start from defaults so fields like LeaseTTL and HeartbeatMS are never
 	// persisted as zero (which would cause a crash on the next restart).
 	cfg := config.ClusterDefaults()
@@ -109,6 +115,7 @@ func (s *Server) handleAdminClusterEnable(w http.ResponseWriter, r *http.Request
 		s.sendError(r, w, http.StatusInternalServerError, ErrInternal, fmt.Sprintf("enable cluster: %v", err))
 		return
 	}
+	s.EmitAudit(r, "cluster.enable", "system", "cluster", "ok", nil)
 	s.sendJSON(w, http.StatusOK, map[string]any{"enabled": true, "role": req.Role})
 }
 
@@ -122,6 +129,7 @@ func (s *Server) handleAdminClusterDisable(w http.ResponseWriter, r *http.Reques
 		s.sendError(r, w, http.StatusInternalServerError, ErrInternal, fmt.Sprintf("persist config: %v", err))
 		return
 	}
+	s.EmitAudit(r, "cluster.disable", "system", "cluster", "ok", nil)
 	s.sendJSON(w, http.StatusOK, map[string]any{"enabled": false})
 }
 
@@ -150,6 +158,7 @@ func (s *Server) handleAdminClusterAddNode(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	s.coordinator.ConnManager().AddPeer("pending-"+req.Addr, req.Addr)
+	s.EmitAudit(r, "cluster.node_add", "system", req.Addr, "ok", nil)
 	s.sendJSON(w, http.StatusAccepted, map[string]any{
 		"addr":    req.Addr,
 		"message": "peer registered; node should now connect and complete join handshake",
@@ -183,6 +192,7 @@ func (s *Server) handleAdminClusterRemoveNode(w http.ResponseWriter, r *http.Req
 		s.sendError(r, w, http.StatusInternalServerError, ErrInternal, fmt.Sprintf("remove node: %v", err))
 		return
 	}
+	s.EmitAudit(r, "cluster.node_remove", "system", nodeID, "ok", nil)
 	s.sendJSON(w, http.StatusOK, map[string]any{"removed": nodeID})
 }
 
@@ -210,6 +220,7 @@ func (s *Server) handleAdminClusterFailover(w http.ResponseWriter, r *http.Reque
 		s.sendError(r, w, http.StatusInternalServerError, ErrInternal, fmt.Sprintf("failover: %v", err))
 		return
 	}
+	s.EmitAudit(r, "cluster.failover", "system", "cluster", "ok", nil)
 	s.sendJSON(w, http.StatusOK, map[string]any{"initiated": true, "target": req.TargetNodeID})
 }
 
@@ -232,6 +243,7 @@ func (s *Server) handleAdminClusterRotateTLS(w http.ResponseWriter, r *http.Requ
 		s.sendError(r, w, http.StatusInternalServerError, ErrInternal, fmt.Sprintf("rotate: %v", err))
 		return
 	}
+	s.EmitAudit(r, "cluster.tls_rotate", "system", "cluster", "ok", nil)
 	s.sendJSON(w, http.StatusOK, map[string]any{"rotated": true})
 }
 

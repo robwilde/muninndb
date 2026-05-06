@@ -88,6 +88,10 @@ func (m *mockEngine) GetSession(ctx context.Context, req *rest.GetSessionRequest
 	return &rest.GetSessionResponse{Entries: []rest.SessionItem{}}, nil
 }
 
+func (m *mockEngine) GetActivityCounts(ctx context.Context, req *rest.ActivityCountsRequest) (*rest.ActivityCountsResponse, error) {
+	return &rest.ActivityCountsResponse{Counts: []rest.ActivityCountItem{}}, nil
+}
+
 func (m *mockEngine) WorkerStats() cognitive.EngineWorkerStats {
 	return cognitive.EngineWorkerStats{}
 }
@@ -186,6 +190,10 @@ func (m *mockEngine) GetProcessorStats() []plugin.RetroactiveStats {
 
 func (m *mockEngine) ExportGraph(ctx context.Context, vault string, includeEngrams bool) (*engine.ExportGraph, error) {
 	return &engine.ExportGraph{}, nil
+}
+
+func (m *mockEngine) EmbedStats() plugin.RetroactiveStats {
+	return plugin.RetroactiveStats{}
 }
 
 func makeMockFS() fs.FS {

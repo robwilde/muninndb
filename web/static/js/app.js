@@ -19,8 +19,25 @@ document.addEventListener('alpine:init', () => {
     // Dashboard
     stats: { engramCount: 0, vaultCount: 0, storageBytes: 0, indexSize: 0 },
     workerStats: [],
+    cognitiveInfoModal: false,
     liveFeed: [],
-    _activityChart: null,
+    activityDays: 7,
+    activityUntil: '',
+    activityShowTable: false,
+    activityData: [],
+    activityLoading: false,
+    activityError: '',
+    activityPresets: [
+      { label: '7d', days: 7 },
+      { label: '14d', days: 14 },
+      { label: '30d', days: 30 },
+      { label: '60d', days: 60 },
+      { label: '90d', days: 90 },
+      { label: '180d', days: 180 },
+    ],
+    _activityFetchId: 0,
+    _activityResizeObserver: null,
+    _prevEngramCount: 0,
     _prevVaultCount: 0,
 
     // Memories
@@ -32,6 +49,7 @@ document.addEventListener('alpine:init', () => {
     memoriesLoading: false,
     memoryFilters: { sort: 'created', tags: '', state: '', minConf: 0, maxConf: 0 },
     selectedMemory: null,
+    detailExpanded: false,
     showNewMemoryModal: false,
     newMemoryForm: { concept: '', content: '', tagsRaw: '', confidence: 0.8 },
     confirmForgetId: null,
@@ -67,6 +85,7 @@ document.addEventListener('alpine:init', () => {
     _cy: null,
     entityGraphLoaded: false,
     entityGraphStatus: '',
+    entityGraphLabelMode: 'full',
     _entityCy: null,
 
     // Session
@@ -197,19 +216,20 @@ document.addEventListener('alpine:init', () => {
       embedApiKey: '',
       embedUrl: '',           // custom base URL for openai-compatible endpoints
       embedShowForm: false,
-      embedSaved: false,
       embedError: '',
-      enrichProvider: 'none', // 'none' | 'ollama' | 'openai' | 'anthropic'
+      enrichProvider: 'none', // 'none' | 'ollama' | 'openai' | 'anthropic' | 'google'
       enrichOllamaModel: 'llama3.2',
       enrichModel: 'claude-haiku-4-5-20251001',
       enrichApiKey: '',
       enrichShowForm: false,
-      enrichSaved: false,
       enrichError: '',
       ollamaModels: [],
       ollamaEmbedModels: [],
       ollamaDetected: null,   // null=unchecked, true=running, false=not found
       ollamaChecking: false,
+      embedRatePerSec: 0,       // from embed-status API: engrams/sec, 0 when idle
+      embedETASecs: 0,          // from embed-status API: seconds until complete, 0 when idle
+      embedHardwareGPU: null,   // null = unknown/cloud; true = GPU; false = CPU-only Ollama
     },
 
     // Vault actions
@@ -244,7 +264,7 @@ document.addEventListener('alpine:init', () => {
         const parts = hash.split('/');
         const raw = parts[0];
         // Only use known views
-        const known = ['dashboard', 'memories', 'graph', 'session', 'settings', 'logs', 'cluster'];
+        const known = ['dashboard', 'memories', 'graph', 'session', 'observability', 'settings', 'logs', 'cluster'];
         this.currentView = known.includes(raw) ? raw : 'dashboard';
 
         // Parse settings sub-tab if entering settings view
@@ -327,7 +347,6 @@ document.addEventListener('alpine:init', () => {
         this.isAuthenticated = true;
         this.loadVaults();
         this.loadWorkerStats();
-        setInterval(() => this.loadWorkerStats(), 10000);
         this.connectLive();
       } catch (_) {
         this.isAuthenticated = false;
@@ -345,6 +364,7 @@ document.addEventListener('alpine:init', () => {
         this.isAuthenticated = true;
         this.loginForm = { username: '', password: '' };
         this.loadVaults();
+        this.loadWorkerStats();
         this.connectLive();
         this.navigateTo('dashboard');
       } catch (err) {
@@ -386,6 +406,19 @@ document.addEventListener('alpine:init', () => {
       if (this._obsInterval) {
         clearInterval(this._obsInterval);
         this._obsInterval = null;
+      }
+
+      // Clean up activity chart resources when leaving dashboard.
+      if (view !== 'dashboard') {
+        const canvas = document.getElementById('activityChart');
+        if (canvas && canvas._chart) {
+          try { canvas._chart.destroy(); } catch (_) {}
+          canvas._chart = null;
+        }
+        if (this._activityResizeObserver) {
+          this._activityResizeObserver.disconnect();
+          this._activityResizeObserver = null;
+        }
       }
 
       if (view === 'dashboard') {
@@ -514,6 +547,26 @@ document.addEventListener('alpine:init', () => {
         }
       };
 
+      es.addEventListener('error', (e) => {
+        // Connection-level errors have null data; onerror already handles those silently.
+        // Only process named 'event: error' server events (which carry non-null data).
+        if (!e.data) return;
+        let msg = 'Live feed error';
+        try {
+          const data = JSON.parse(e.data);
+          if (data.error) msg = 'Live feed: ' + data.error;
+        } catch (_) {}
+        console.warn('[muninn] SSE error event:', msg);
+        this.addNotification('error', msg);
+        this.liveConnected = false;
+        es.close();
+        this._es = null;
+        window._muninnSSE = null;
+        const delay = Math.min(500 * Math.pow(1.5, this._esRetries), 30000);
+        this._esRetries++;
+        setTimeout(() => this.connectLive(), delay);
+      });
+
       this._es = es;
     },
 
@@ -530,6 +583,23 @@ document.addEventListener('alpine:init', () => {
         // Re-fetch stats scoped to the selected vault instead of using
         // the global broadcast values.
         this.loadStats();
+      } else if (msg.type === 'workers_update') {
+        const d = msg.data;
+        if (d) {
+          const map = { Hebbian: d.hebbian, Contradict: d.contradict, Confidence: d.confidence };
+          this.workerStats = Object.entries(map)
+            .filter(([, w]) => w != null)
+            .map(([name, w]) => ({
+              name,
+              state:         w.state         ?? 0,
+              processed:     w.processed     ?? 0,
+              batches:       w.batches       ?? 0,
+              errors:        w.errors        ?? 0,
+              dropped:       w.dropped       ?? 0,
+              lastRun:       w.lastRun       ?? 0,
+              effectiveWait: w.effectiveWait ?? 0,
+            }));
+        }
       } else if (msg.type === 'memory_added') {
         // Guard: skip malformed events missing required fields.
         // A missing or undefined id causes Alpine x-for to use 'undefined' as
@@ -584,12 +654,19 @@ document.addEventListener('alpine:init', () => {
     async loadWorkerStats() {
       try {
         const data = await this.apiCall('/api/workers');
-        this.workerStats = [
-          { name: 'Temporal',    state: data.decay?.state      ?? 0 },
-          { name: 'Hebbian',     state: data.hebbian?.state    ?? 0 },
-          { name: 'Contradict',  state: data.contradict?.state ?? 0 },
-          { name: 'Confidence',  state: data.confidence?.state ?? 0 },
-        ];
+        const map = { Hebbian: data.hebbian, Contradict: data.contradict, Confidence: data.confidence };
+        this.workerStats = Object.entries(map)
+          .filter(([, d]) => d != null)
+          .map(([name, d]) => ({
+            name,
+            state:        d.state        ?? 0,
+            processed:    d.processed    ?? 0,
+            batches:      d.batches      ?? 0,
+            errors:       d.errors       ?? 0,
+            dropped:      d.dropped      ?? 0,
+            lastRun:      d.lastRun      ?? 0,
+            effectiveWait: d.effectiveWait ?? 0,
+          }));
       } catch (err) {
         console.warn('[muninn] worker stats failed:', err);
       }
@@ -602,6 +679,71 @@ document.addEventListener('alpine:init', () => {
     workerStateBadge(state) {
       const classes = ['badge-active', 'badge-idle', 'badge-dormant'];
       return classes[state] ?? 'badge-idle';
+    },
+
+    formatWorkerProcessed(n) {
+      if (!n) return '—';
+      if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+      if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'k';
+      return String(n);
+    },
+
+    formatWorkerLastRun(nanos) {
+      if (!nanos) return 'never';
+      const ago = Date.now() - nanos / 1_000_000;
+      if (ago < 5_000)        return 'just now';
+      if (ago < 60_000)       return Math.floor(ago / 1_000) + 's ago';
+      if (ago < 3_600_000)    return Math.floor(ago / 60_000) + 'm ago';
+      if (ago < 86_400_000)   return Math.floor(ago / 3_600_000) + 'h ago';
+      return Math.floor(ago / 86_400_000) + 'd ago';
+    },
+
+    workerTooltip(w) {
+      const lines = [
+        `${w.name}  ·  ${this.workerStateName(w.state)}`,
+        `Processed: ${w.processed}  ·  Batches: ${w.batches}`,
+        `Last run: ${this.formatWorkerLastRun(w.lastRun)}`,
+      ];
+      if (w.errors  > 0) lines.push(`Errors: ${w.errors}`);
+      if (w.dropped > 0) lines.push(`Dropped: ${w.dropped}`);
+      return lines.join('\n');
+    },
+
+    workerDotStyle(state) {
+      const colors = ['#10b981', '#f59e0b', '#9ca3af']; // active, idle, dormant
+      return `background:${colors[state] ?? '#9ca3af'};`;
+    },
+
+    workerStateStyle(state) {
+      const styles = ['color:#10b981;', 'color:#f59e0b;', 'color:#9ca3af;'];
+      return styles[state] ?? 'color:#9ca3af;';
+    },
+
+    workersOverallHealthLabel() {
+      if (!this.workerStats.length) return 'Loading';
+      const active = this.workerStats.filter(w => w.state === 0).length;
+      const idle   = this.workerStats.filter(w => w.state === 1).length;
+      if (active === this.workerStats.length) return 'All Active';
+      if (active > 0) return active + ' Active';
+      if (idle   > 0) return idle + ' Idle';
+      return 'Dormant';
+    },
+
+    workersOverallHealthStyle() {
+      const base = 'font-size:0.6875rem;padding:0.1rem 0.5rem;border-radius:9999px;font-weight:600;';
+      if (!this.workerStats.length) return base + 'background:#6b728020;color:#6b7280;';
+      const active = this.workerStats.filter(w => w.state === 0).length;
+      const idle   = this.workerStats.filter(w => w.state === 1).length;
+      if (active === this.workerStats.length) return base + 'background:#10b98120;color:#10b981;';
+      if (active > 0) return base + 'background:#f59e0b20;color:#f59e0b;';
+      if (idle   > 0) return base + 'background:#f59e0b20;color:#f59e0b;';
+      return base + 'background:#6b728020;color:#6b7280;';
+    },
+
+    workersLastRunSummary() {
+      if (!this.workerStats.length) return '—';
+      const max = Math.max(...this.workerStats.map(w => w.lastRun || 0));
+      return this.formatWorkerLastRun(max);
     },
 
     async loadVaults() {
@@ -639,66 +781,167 @@ document.addEventListener('alpine:init', () => {
     _initChart() {
       const canvas = document.getElementById('activityChart');
       if (!canvas) return;
-      if (this._activityChart) {
-        this._activityChart.destroy();
-        this._activityChart = null;
+
+      // Monotonic fetch ID — stale responses are discarded.
+      const fetchId = ++this._activityFetchId;
+
+      const days = Math.max(1, Math.min(180, this.activityDays || 7));
+      let url = '/api/activity-counts?vault=' + encodeURIComponent(this.vault) + '&days=' + days;
+      if (this.activityUntil) {
+        url += '&until=' + encodeURIComponent(this.activityUntil);
       }
 
-      // Last 7 days labels
-      const labels = [];
-      const now = new Date();
-      for (let i = 6; i >= 0; i--) {
-        const d = new Date(now);
-        d.setDate(d.getDate() - i);
-        labels.push(d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }));
+      this.activityLoading = true;
+      this.activityError = '';
+      this.activityData = [];
+
+      this.apiCall(url).then(resp => {
+        // Stale response — a newer call superseded this one.
+        if (this._activityFetchId !== fetchId) return;
+
+        this.activityLoading = false;
+        const counts = resp.counts || [];
+        this.activityData = counts;
+
+        const labels = counts.map(c => c.date);
+        const data = counts.map(c => c.count);
+
+        // Dynamic tick grouping: estimate how many labels fit based on canvas width.
+        const canvasWidth = canvas.parentElement ? canvas.parentElement.clientWidth : canvas.width;
+        const maxTicks = Math.max(4, Math.floor(canvasWidth / 60));
+
+        this._renderActivityChart(canvas, labels, data, maxTicks);
+
+        // Set up a resize observer so tick density adapts to layout changes.
+        if (!this._activityResizeObserver && canvas.parentElement) {
+          this._activityResizeObserver = new ResizeObserver(() => {
+            const chart = canvas._chart;
+            if (!chart) return;
+            const w = canvas.parentElement ? canvas.parentElement.clientWidth : canvas.width;
+            const mt = Math.max(4, Math.floor(w / 60));
+            try {
+              chart.options.scales.x.ticks.maxTicksLimit = mt;
+              chart.update('none');
+            } catch (_) { /* best effort */ }
+          });
+          this._activityResizeObserver.observe(canvas.parentElement);
+        }
+      }).catch(err => {
+        if (this._activityFetchId !== fetchId) return;
+        this.activityLoading = false;
+        let message = 'Failed to load activity data';
+        if (err && typeof err.message === 'string' && err.message.trim() !== '') {
+          message += ': ' + err.message;
+        }
+        this.activityError = message;
+      });
+    },
+
+    _renderActivityChart(canvas, labels, data, maxTicks) {
+      // Store chart instance on the canvas DOM element — NOT on `this` —
+      // because Alpine.js wraps component properties in reactive Proxies
+      // which cause infinite recursion when Chart.js traverses its own data.
+      const existing = canvas._chart;
+      if (existing) {
+        try {
+          existing.data.labels = labels;
+          existing.data.datasets[0].data = data;
+          existing.options.scales.x.ticks.maxTicksLimit = maxTicks;
+          existing.update();
+          return;
+        } catch (_) {
+          try { existing.destroy(); } catch (_) {}
+          canvas._chart = null;
+        }
       }
 
-      // Fetch session data for 7 days
-      const since = new Date(Date.now() - 7 * 86400 * 1000).toISOString();
-      this.apiCall(
-        '/api/session?vault=' + encodeURIComponent(this.vault) +
-        '&since=' + encodeURIComponent(since) + '&limit=500'
-      ).then(resp => {
-        const entries = resp.entries || (Array.isArray(resp) ? resp : []);
-        const counts = new Array(7).fill(0);
-        entries.forEach(e => {
-          if (!e.created_at) return;
-          const diffMs = now - new Date(e.created_at * 1000);
-          const diffDays = Math.floor(diffMs / 86400000);
-          const idx = 6 - diffDays;
-          if (idx >= 0 && idx < 7) counts[idx]++;
-        });
-
-        this._activityChart = new Chart(canvas, {
-          type: 'bar',
-          data: {
-            labels,
-            datasets: [{
-              label: 'Engrams written',
-              data: counts,
-              backgroundColor: 'rgba(6,182,212,0.5)',
-              borderColor: '#06b6d4',
-              borderWidth: 1,
-              borderRadius: 4,
-            }],
-          },
-          options: {
-            responsive: true,
-            plugins: { legend: { display: false } },
-            scales: {
-              x: {
-                grid: { color: 'rgba(42,42,74,0.5)' },
-                ticks: { color: '#94a3b8' },
-              },
-              y: {
-                grid: { color: 'rgba(42,42,74,0.5)' },
-                ticks: { color: '#94a3b8', stepSize: 1 },
-                beginAtZero: true,
+      canvas._chart = new Chart(canvas, {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [{
+            label: 'Engrams written',
+            data,
+            backgroundColor: 'rgba(6,182,212,0.5)',
+            borderColor: '#06b6d4',
+            borderWidth: 1,
+            borderRadius: 4,
+          }],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false },
+            tooltip: {
+              callbacks: {
+                title: function(items) { return items[0] ? items[0].label : ''; },
+                label: function(item) { return item.parsed.y + ' engram' + (item.parsed.y !== 1 ? 's' : ''); },
               },
             },
           },
+          scales: {
+            x: {
+              grid: { color: 'rgba(42,42,74,0.5)' },
+              ticks: {
+                color: '#94a3b8',
+                maxTicksLimit: maxTicks,
+                maxRotation: 45,
+                callback: function(value, index) {
+                  const label = this.getLabelForValue(value);
+                  const parts = label.split('-');
+                  if (parts.length === 3) {
+                    // Parse as UTC to avoid timezone-induced date shift.
+                    const d = new Date(label + 'T00:00:00Z');
+                    if (isNaN(d.getTime())) return label;
+                    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+                  }
+                  return label;
+                },
+              },
+            },
+            y: {
+              grid: { color: 'rgba(42,42,74,0.5)' },
+              ticks: { color: '#94a3b8' },
+              beginAtZero: true,
+            },
+          },
+        },
+      });
+    },
+
+    _copyActivityTable() {
+      const header = 'Date\tCount';
+      const rows = this.activityData.map(r => r.date + '\t' + r.count);
+      const total = this.activityData.reduce((s, r) => s + r.count, 0);
+      rows.push('Total\t' + total);
+      const text = header + '\n' + rows.join('\n');
+
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => {
+          this.addNotification('success', 'Activity data copied to clipboard');
+        }).catch(() => {
+          this._copyFallback(text);
         });
-      }).catch(() => {});
+      } else {
+        this._copyFallback(text);
+      }
+    },
+
+    _copyFallback(text) {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      try {
+        ta.select();
+        const ok = document.execCommand('copy');
+        this.addNotification(ok ? 'success' : 'error', ok ? 'Activity data copied to clipboard' : 'Copy failed — please copy manually');
+      } catch (_) {
+        this.addNotification('error', 'Copy failed — please copy manually');
+      } finally {
+        document.body.removeChild(ta);
+      }
     },
 
     formatBytes(bytes) {
@@ -733,7 +976,7 @@ document.addEventListener('alpine:init', () => {
         if (f.minConf > 0) url += '&min_confidence=' + f.minConf;
         if (f.maxConf > 0) url += '&max_confidence=' + f.maxConf;
         const data = await this.apiCall(url);
-        this.memories = data.engrams || [];
+        this.memories = (data.engrams || []).map(e => ({ ...e, createdAt: e.created_at }));
         this.totalMemories = data.total || 0;
       } catch (err) {
         this.addNotification('error', 'Load failed: ' + err.message);
@@ -753,13 +996,12 @@ document.addEventListener('alpine:init', () => {
         // ActivateRequest uses context:[]string, max_results:int
         const body = {
             context: [this.searchQuery.trim()],
-            vault: this.vault,
             max_results: 20,
         };
         if (this.searchMode && this.searchMode !== 'balanced') {
             body.mode = this.searchMode;
         }
-        const data = await this.apiCall('/api/activate', {
+        const data = await this.apiCall('/api/activate?vault=' + encodeURIComponent(this.vault), {
           method: 'POST',
           body: JSON.stringify(body),
         });
@@ -798,43 +1040,36 @@ document.addEventListener('alpine:init', () => {
       try {
         if (action === 'keep_a') {
           // A supersedes B; archive B
-          await fetch('/api/link', {
+          await this.apiCall('/api/link?vault=' + encodeURIComponent(vault), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ source_id: idA, target_id: idB, rel_type: 4, weight: 1.0, vault }),
+            body: JSON.stringify({ source_id: idA, target_id: idB, rel_type: 4, weight: 1.0 }),
           });
-          await fetch('/api/engrams/' + encodeURIComponent(idB) + '/state', {
+          await this.apiCall('/api/engrams/' + encodeURIComponent(idB) + '/state?vault=' + encodeURIComponent(vault), {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ vault, state: 'archived' }),
+            body: JSON.stringify({ state: 'archived' }),
           });
-          await fetch('/api/admin/contradictions/resolve', {
+          await this.apiCall('/api/admin/contradictions/resolve?vault=' + encodeURIComponent(vault), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ vault, id_a: idA, id_b: idB }),
+            body: JSON.stringify({ id_a: idA, id_b: idB }),
           });
         } else if (action === 'keep_b') {
           // B supersedes A; archive A
-          await fetch('/api/link', {
+          await this.apiCall('/api/link?vault=' + encodeURIComponent(vault), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ source_id: idB, target_id: idA, rel_type: 4, weight: 1.0, vault }),
+            body: JSON.stringify({ source_id: idB, target_id: idA, rel_type: 4, weight: 1.0 }),
           });
-          await fetch('/api/engrams/' + encodeURIComponent(idA) + '/state', {
+          await this.apiCall('/api/engrams/' + encodeURIComponent(idA) + '/state?vault=' + encodeURIComponent(vault), {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ vault, state: 'archived' }),
+            body: JSON.stringify({ state: 'archived' }),
           });
-          await fetch('/api/admin/contradictions/resolve', {
+          await this.apiCall('/api/admin/contradictions/resolve?vault=' + encodeURIComponent(vault), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ vault, id_a: idA, id_b: idB }),
+            body: JSON.stringify({ id_a: idA, id_b: idB }),
           });
         } else if (action === 'dismiss') {
-          await fetch('/api/admin/contradictions/resolve', {
+          await this.apiCall('/api/admin/contradictions/resolve?vault=' + encodeURIComponent(vault), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ vault, id_a: idA, id_b: idB }),
+            body: JSON.stringify({ id_a: idA, id_b: idB }),
           });
         } else if (action === 'merge') {
           // Open consolidate modal pre-filled with both IDs
@@ -857,7 +1092,7 @@ document.addEventListener('alpine:init', () => {
           const resp = await fetch('/api/engrams/' + encodeURIComponent(m.id) + '?vault=' + encodeURIComponent(this.vault));
           if (resp.ok) {
             const full = await resp.json();
-            m = { ...m, ...full };
+            m = { ...m, ...full, createdAt: full.created_at || m.createdAt };
           }
         } catch (e) { /* fall through with partial data */ }
       }
@@ -909,13 +1144,12 @@ document.addEventListener('alpine:init', () => {
         : [];
       try {
         // POST /api/engrams → WriteRequest: { concept, content, tags, vault, confidence }
-        await this.apiCall('/api/engrams', {
+        await this.apiCall('/api/engrams?vault=' + encodeURIComponent(this.vault), {
           method: 'POST',
           body: JSON.stringify({
             concept: form.concept,
             content: form.content,
             tags,
-            vault: this.vault,
             confidence: parseFloat(form.confidence) || 0.8,
           }),
         });
@@ -996,10 +1230,10 @@ document.addEventListener('alpine:init', () => {
       this.editTagsSaving = true;
       try {
         const resp = await this.apiCall(
-          '/api/engrams/' + encodeURIComponent(this.selectedMemory.id) + '/tags',
+          '/api/engrams/' + encodeURIComponent(this.selectedMemory.id) + '/tags?vault=' + encodeURIComponent(this.vault),
           {
             method: 'PUT',
-            body: JSON.stringify({ vault: this.vault, tags }),
+            body: JSON.stringify({ tags }),
           }
         );
         this.selectedMemory = { ...this.selectedMemory, tags: resp.tags };
@@ -1033,14 +1267,13 @@ document.addEventListener('alpine:init', () => {
         return;
       }
       try {
-        await this.apiCall('/api/link', {
+        await this.apiCall('/api/link?vault=' + encodeURIComponent(this.vault), {
           method: 'POST',
           body: JSON.stringify({
             source_id: this.linkModal.sourceId,
             target_id: this.linkModal.targetId.trim(),
             rel_type: parseInt(this.linkModal.relType, 10),
             weight: parseFloat(this.linkModal.weight),
-            vault: this.vault,
           }),
         });
         this.closeLinkModal();
@@ -1106,13 +1339,16 @@ document.addEventListener('alpine:init', () => {
 
     // ── Graph ──────────────────────────────────────────────────────────────
     graphShowOrphans: false,
+    graphLimit: 50,
 
     async loadGraph() {
       this.addNotification('info', 'Loading graph…');
       try {
         // Use GET /api/engrams for node listing
+        const limit = Math.max(1, Math.min(200, parseInt(this.graphLimit, 10) || 50));
+        this.graphLimit = limit;
         const data = await this.apiCall(
-          '/api/engrams?vault=' + encodeURIComponent(this.vault) + '&limit=50&offset=0'
+          '/api/engrams?vault=' + encodeURIComponent(this.vault) + '&limit=' + limit + '&offset=0'
         );
         const engrams = data.engrams || [];
         if (!engrams.length) {
@@ -1122,11 +1358,10 @@ document.addEventListener('alpine:init', () => {
 
         // Load all engram links in a single batch call (replaces N+1 pattern).
         const nodeIdSet = new Set(engrams.map(e => e.id));
-        const batchResp = await this.apiCall('/api/engrams/links/batch', {
+        const batchResp = await this.apiCall('/api/engrams/links/batch?vault=' + encodeURIComponent(this.vault), {
           method: 'POST',
           body: JSON.stringify({
             ids: engrams.map(e => e.id),
-            vault: this.vault,
           }),
         });
         const linksMap = batchResp.links || {};
@@ -1312,8 +1547,14 @@ document.addEventListener('alpine:init', () => {
       this._cy.nodes().forEach(node => {
         const lbl = mode === 'full' ? node.data('label')
                   : mode === 'short' ? node.data('shortLabel')
-                  : '';
-        node.style('label', lbl);
+                  : node.data('label');
+        node.style({
+          label: lbl,
+          'text-opacity': mode === 'none' ? 0 : 1,
+        });
+      });
+      this._cy.edges().forEach(edge => {
+        edge.style({ 'text-opacity': mode === 'none' ? 0 : 1 });
       });
     },
 
@@ -1341,6 +1582,7 @@ document.addEventListener('alpine:init', () => {
             data: {
               id: n.id,
               label: n.id,
+              shortLabel: n.id.length > 20 ? n.id.slice(0, 18) + '…' : n.id,
               type: entityType,
               size: 16,
               color: this.getEntityTypeColor(entityType),
@@ -1389,17 +1631,19 @@ document.addEventListener('alpine:init', () => {
                 'height': 'data(size)',
                 'label': 'data(label)',
                 'color': '#e2e8f0',
-                'font-size': '11px',
-                'text-valign': 'center',
+                'font-size': '10px',
+                'text-valign': 'bottom',
                 'text-halign': 'center',
+                'text-margin-y': 6,
                 'border-width': 'data(borderWidth)',
                 'border-color': 'data(borderColor)',
-                'text-background-opacity': 0.6,
-                'text-background-color': 'rgba(0,0,0,0.5)',
+                'text-background-opacity': 0.7,
+                'text-background-color': 'rgba(0,0,0,0.6)',
                 'text-background-padding': '2px',
                 'text-background-shape': 'roundrectangle',
-                'text-wrap': 'wrap',
-                'text-max-width': '80px'
+                'text-wrap': 'ellipsis',
+                'text-max-width': '100px',
+                'min-zoomed-font-size': 8
               }
             },
             {
@@ -1433,7 +1677,19 @@ document.addEventListener('alpine:init', () => {
             name: 'fcose',
             animate: true,
             animationDuration: 600,
-            animationEasing: 'ease-out'
+            animationEasing: 'ease-out',
+            randomize: true,
+            padding: 60,
+            idealEdgeLength: 250,
+            nodeRepulsion: 50000,
+            edgeElasticity: 0.1,
+            gravity: 0.02,
+            gravityRange: 1.5,
+            numIter: 5000,
+            tile: true,
+            tilingPaddingVertical: 60,
+            tilingPaddingHorizontal: 60,
+            nodeSeparation: 200
           },
           wheelSensitivity: 0.3
         });
@@ -1445,6 +1701,7 @@ document.addEventListener('alpine:init', () => {
         });
 
         this.entityGraphLoaded = true;
+        this._applyEntityGraphLabelStyle();
         this.entityGraphStatus = 'Loaded ' + nodes.length + ' entities, ' + edges.length + ' relationships';
         this.addNotification('success', this.entityGraphStatus);
       } catch (err) {
@@ -1484,6 +1741,28 @@ document.addEventListener('alpine:init', () => {
     entityGraphFit() {
       if (this._entityCy) { this._entityCy.fit(); }
     },
+    entityGraphCycleLabel() {
+      const modes = ['full', 'short', 'none'];
+      const next = modes[(modes.indexOf(this.entityGraphLabelMode) + 1) % modes.length];
+      this.entityGraphLabelMode = next;
+      this._applyEntityGraphLabelStyle();
+    },
+    _applyEntityGraphLabelStyle() {
+      if (!this._entityCy) return;
+      const mode = this.entityGraphLabelMode;
+      this._entityCy.nodes().forEach(node => {
+        const lbl = mode === 'full' ? node.data('label')
+                  : mode === 'short' ? node.data('shortLabel')
+                  : node.data('label');
+        node.style({
+          label: lbl,
+          'text-opacity': mode === 'none' ? 0 : 1,
+        });
+      });
+      this._entityCy.edges().forEach(edge => {
+        edge.style({ 'text-opacity': mode === 'none' ? 0 : 1 });
+      });
+    },
 
     // ── Session ────────────────────────────────────────────────────────────
     async loadSession() {
@@ -1496,7 +1775,8 @@ document.addEventListener('alpine:init', () => {
           '&since=' + encodeURIComponent(since) + '&limit=100'
         );
         // GetSessionResponse has { entries: [] } or raw array
-        this.sessionEntries = data.entries || (Array.isArray(data) ? data : []);
+        const raw = data.entries || (Array.isArray(data) ? data : []);
+        this.sessionEntries = raw.map(e => ({ ...e, createdAt: e.created_at }));
       } catch (err) {
         this.addNotification('error', 'Session: ' + err.message);
       }
@@ -1532,11 +1812,20 @@ document.addEventListener('alpine:init', () => {
     // ── Settings ───────────────────────────────────────────────────────────
     async loadEmbedStatus() {
       try {
-        this.embedStatus = await this.apiCall('/api/admin/embed/status');
-        // Reflect the active provider in the plugin config UI (local is default, not a plugin choice)
-        const p = this.embedStatus?.provider;
-        if (p && p !== 'none' && p !== 'local') {
+        const data = await this.apiCall('/api/admin/embed/status');
+        this.embedStatus = data;
+        // Reflect the active provider in the plugin config UI
+        const p = data?.provider;
+        if (p && p !== 'none') {
           this.pluginCfg.embedProvider = p;
+        }
+        this.pluginCfg.embedRatePerSec = data.rate_per_sec ?? 0;
+        this.pluginCfg.embedETASecs    = data.eta_seconds ?? 0;
+        // hardware_accelerated is absent for cloud providers; present (true/false) for Ollama
+        if (Object.prototype.hasOwnProperty.call(data, 'hardware_accelerated')) {
+          this.pluginCfg.embedHardwareGPU = data.hardware_accelerated;
+        } else {
+          this.pluginCfg.embedHardwareGPU = null;
         }
       } catch (_) {
         // Non-fatal: embedStatus stays null, UI shows fallback
@@ -1697,7 +1986,7 @@ document.addEventListener('alpine:init', () => {
                 datasets: [{
                     data: this._plasticityData[p],
                     borderColor: c.border,
-                    backgroundColor: c.bg,
+                    backgroundColor: this.isDarkMode ? c.bg.replace('0.35)', '0.5)') : c.bg,
                     borderWidth: 2.5,
                     pointRadius: 5,
                     pointBackgroundColor: c.border,
@@ -1710,8 +1999,8 @@ document.addEventListener('alpine:init', () => {
                 scales: { r: {
                     min: 0, max: 1,
                     ticks: { display: false },
-                    grid: { color: this.isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)' },
-                    angleLines: { color: this.isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)' },
+                    grid: { color: this.isDarkMode ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.08)' },
+                    angleLines: { color: this.isDarkMode ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.08)' },
                     pointLabels: { color: this.isDarkMode ? '#9ca3af' : '#6b7280', font: { size: 11 } },
                 }},
                 plugins: { legend: { display: false } },
@@ -1747,7 +2036,7 @@ document.addEventListener('alpine:init', () => {
             const c = this._plasticityColors[p];
             ds.data             = this._plasticityData[p];
             ds.borderColor      = c.border;
-            ds.backgroundColor  = c.bg;
+            ds.backgroundColor  = this.isDarkMode ? c.bg.replace('0.35)', '0.5)') : c.bg;
             ds.pointBackgroundColor = c.border;
         }
         chart.update();
@@ -1793,13 +2082,42 @@ document.addEventListener('alpine:init', () => {
     },
 
     async copyToClipboard(text) {
+      // navigator.clipboard requires a secure context (HTTPS or localhost).
+      // Installations accessed over plain HTTP (e.g. a LAN IP like
+      // 192.168.x.x:8476) have navigator.clipboard === undefined, causing
+      // the previous implementation to always throw and show an error toast.
+      // Fall back to the legacy execCommand path for non-secure contexts.
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        try {
+          await navigator.clipboard.writeText(text);
+          this.connectCopied = true;
+          setTimeout(() => { this.connectCopied = false; }, 2000);
+          this.addNotification('success', 'Copied to clipboard');
+          return;
+        } catch (_) {
+          // Fall through to execCommand fallback.
+        }
+      }
+      // execCommand fallback — works on HTTP and older browsers.
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
       try {
-        await navigator.clipboard.writeText(text);
-        this.connectCopied = true;
-        setTimeout(() => { this.connectCopied = false; }, 2000);
-        this.addNotification('success', 'Copied to clipboard');
+        ta.select();
+        const ok = document.execCommand('copy');
+        if (ok) {
+          this.connectCopied = true;
+          setTimeout(() => { this.connectCopied = false; }, 2000);
+          this.addNotification('success', 'Copied to clipboard');
+        } else {
+          this.addNotification('error', 'Copy failed — please select and copy manually');
+        }
       } catch (_) {
-        this.addNotification('error', 'Copy failed — select and copy manually');
+        this.addNotification('error', 'Copy failed — please select and copy manually');
+      } finally {
+        document.body.removeChild(ta);
       }
     },
 
@@ -1843,6 +2161,31 @@ document.addEventListener('alpine:init', () => {
       const embedded = this.embedStatus.embedded_count;
       if (total <= 0 || embedded < 0) return 0;
       return Math.min(100, Math.round((embedded / total) * 100));
+    },
+
+    // Returns a formatted rate string like "0.7s/embedding", or '' when idle.
+    embedSecsPerItem() {
+      if (this.pluginCfg.embedRatePerSec > 0) {
+        return (1 / this.pluginCfg.embedRatePerSec).toFixed(1) + 's/embedding';
+      }
+      return '';
+    },
+
+    // Returns a human-readable ETA string like "~3 min", or '' when idle.
+    embedETADisplay() {
+      const secs = this.pluginCfg.embedETASecs;
+      if (secs <= 0) return '';
+      if (secs < 60) return '< 1 min';
+      const mins = Math.round(secs / 60);
+      if (mins < 60) return '~' + mins + ' min';
+      const hrs = Math.floor(mins / 60);
+      const rem = mins % 60;
+      return rem > 0 ? '~' + hrs + ' hr ' + rem + ' min' : '~' + hrs + ' hr';
+    },
+
+    // True only when Ollama is the embed provider and hardware_accelerated is explicitly false.
+    get embedIsCPU() {
+      return this.pluginCfg.embedHardwareGPU === false;
     },
 
     // ── Cluster ────────────────────────────────────────────────────────────
@@ -2138,9 +2481,29 @@ document.addEventListener('alpine:init', () => {
 
     copyToken() {
       if (!this.clusterToken?.token) return;
-      navigator.clipboard.writeText(this.clusterToken.token).catch(() => {});
-      this.clusterTokenCopied = true;
-      setTimeout(() => { this.clusterTokenCopied = false; }, 2000);
+      const text = this.clusterToken.token;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => {
+          this.clusterTokenCopied = true;
+          setTimeout(() => { this.clusterTokenCopied = false; }, 2000);
+        }).catch(() => {});
+        return;
+      }
+      // execCommand fallback for non-secure contexts (plain HTTP LAN installs).
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      try {
+        ta.select();
+        if (document.execCommand('copy')) {
+          this.clusterTokenCopied = true;
+          setTimeout(() => { this.clusterTokenCopied = false; }, 2000);
+        }
+      } finally {
+        document.body.removeChild(ta);
+      }
     },
 
     async loadClusterSettings() {
@@ -2245,9 +2608,7 @@ document.addEventListener('alpine:init', () => {
     // ── Plugin config save ───────────────────────────────────────────────────
     async savePluginConfig(section) {
       const c = this.pluginCfg;
-      const savedKey = section + 'Saved';
       const errorKey = section + 'Error';
-      c[savedKey] = false;
       c[errorKey] = '';
 
       // Build payload from current pluginCfg state.
@@ -2260,14 +2621,16 @@ document.addEventListener('alpine:init', () => {
           ? `ollama://localhost:11434/${c.enrichOllamaModel}`
           : c.enrichProvider === 'openai' ? 'openai://gpt-4o-mini'
           : c.enrichProvider === 'anthropic' ? `anthropic://${c.enrichModel}`
+          : c.enrichProvider === 'google' ? `google://${c.enrichModel}`
           : '',
-        enrich_api_key: (c.enrichProvider === 'openai' || c.enrichProvider === 'anthropic') ? c.enrichApiKey : '',
+        enrich_api_key: (c.enrichProvider === 'openai' || c.enrichProvider === 'anthropic' || c.enrichProvider === 'google') ? c.enrichApiKey : '',
       };
 
       try {
         await this.apiCall('/api/admin/plugin-config', { method: 'PUT', body: JSON.stringify(payload) });
-        c[savedKey] = true;
-        setTimeout(() => { c[savedKey] = false; }, 4000);
+        this.addNotification('success', section === 'embed'
+          ? 'Embedding provider saved — restart MuninnDB to apply.'
+          : 'Enrichment provider saved — restart MuninnDB to apply.');
         if (section === 'embed') c.embedShowForm = false;
         if (section === 'enrich') c.enrichShowForm = false;
       } catch (e) {
@@ -2500,7 +2863,7 @@ document.addEventListener('alpine:init', () => {
 
     // ── Vault import ───────────────────────────────────────────────────────
     openImportModal() {
-      this.importModal = { show: true, vaultName: '', file: null, resetMeta: false };
+      this.importModal = { show: true, vaultName: '', file: null, resetMeta: false, uploading: false };
     },
 
     async startImport() {
@@ -2509,6 +2872,7 @@ document.addEventListener('alpine:init', () => {
         vault: this.importModal.vaultName,
         reset_metadata: this.importModal.resetMeta ? 'true' : 'false',
       });
+      this.importModal.uploading = true;
       try {
         const res = await fetch('/api/admin/vaults/import?' + params.toString(), {
           method: 'POST',
@@ -2528,6 +2892,8 @@ document.addEventListener('alpine:init', () => {
         });
       } catch (e) {
         this.addNotification('error', 'Import failed: ' + (e?.message || 'unknown error'));
+      } finally {
+        this.importModal.uploading = false;
       }
     },
 
@@ -2556,15 +2922,10 @@ document.addEventListener('alpine:init', () => {
     // ── Lifecycle state ────────────────────────────────────────────────────
     async updateLifecycleState(id, state) {
       try {
-        const res = await fetch('/api/engrams/' + encodeURIComponent(id) + '/state', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ vault: this.vault, state }),
-        });
-        if (!res.ok) {
-          const text = await res.text().catch(() => res.statusText);
-          throw new Error(res.status + ': ' + text);
-        }
+        const res = await this.apiCall(
+          '/api/engrams/' + encodeURIComponent(id) + '/state?vault=' + encodeURIComponent(this.vault),
+          { method: 'PUT', body: JSON.stringify({ state }) }
+        );
         if (this.selectedMemory && this.selectedMemory.id === id) {
           this.selectedMemory = { ...this.selectedMemory, state };
         }
@@ -2611,10 +2972,9 @@ document.addEventListener('alpine:init', () => {
       if (!this.searchQuery.trim()) return;
       this.explainModal = { show: true, data: null, loading: true };
       try {
-        const data = await this.apiCall('/api/explain', {
+        const data = await this.apiCall('/api/explain?vault=' + encodeURIComponent(this.vault), {
           method: 'POST',
           body: JSON.stringify({
-            vault: this.vault,
             engram_id: engramId,
             query: [this.searchQuery.trim()],
           }),
@@ -2664,10 +3024,9 @@ document.addEventListener('alpine:init', () => {
         return;
       }
       try {
-        const data = await this.apiCall('/api/consolidate', {
+        const data = await this.apiCall('/api/consolidate?vault=' + encodeURIComponent(this.vault), {
           method: 'POST',
           body: JSON.stringify({
-            vault: this.vault,
             ids: this.selectedMemoryIds,
             merged_content: this.consolidateModal.mergedContent.trim(),
           }),
@@ -2704,10 +3063,9 @@ document.addEventListener('alpine:init', () => {
         .map(s => s.trim())
         .filter(Boolean);
       try {
-        const data = await this.apiCall('/api/decide', {
+        const data = await this.apiCall('/api/decide?vault=' + encodeURIComponent(this.vault), {
           method: 'POST',
           body: JSON.stringify({
-            vault: this.vault,
             decision: this.decideModal.decision.trim(),
             rationale: this.decideModal.rationale.trim(),
             alternatives,

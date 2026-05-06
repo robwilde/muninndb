@@ -68,14 +68,18 @@ func AssocRevKey(ws [8]byte, dst [16]byte, weight float32, src [16]byte) []byte 
 }
 
 // FTSPostingKey constructs the FTS posting list entry key (0x05 prefix).
-func FTSPostingKey(ws [8]byte, term string, id [16]byte) []byte {
+// Format: 0x05 | ws[8] | term | 0x00 | field[1] | id[16]
+// The field byte ensures each (term, field, engram) triple has a unique key,
+// preventing multi-field postings from overwriting each other.
+func FTSPostingKey(ws [8]byte, term string, field uint8, id [16]byte) []byte {
 	termBytes := []byte(term)
-	key := make([]byte, 1+8+len(termBytes)+1+16)
+	key := make([]byte, 1+8+len(termBytes)+1+1+16)
 	key[0] = 0x05
 	copy(key[1:9], ws[:])
 	copy(key[9:9+len(termBytes)], termBytes)
-	key[9+len(termBytes)] = 0x00
-	copy(key[10+len(termBytes):], id[:])
+	key[9+len(termBytes)] = 0x00 // separator
+	key[10+len(termBytes)] = field
+	copy(key[11+len(termBytes):], id[:])
 	return key
 }
 
@@ -587,6 +591,16 @@ func RelationshipPrefix(ws [8]byte) []byte {
 	return key
 }
 
+// RelationshipEngramPrefix returns the 25-byte scan prefix for all relationship
+// records sourced from a specific engram (0x21 | ws(8) | engramID(16)).
+func RelationshipEngramPrefix(ws [8]byte, engramID [16]byte) []byte {
+	key := make([]byte, 1+8+16)
+	key[0] = 0x21
+	copy(key[1:9], ws[:])
+	copy(key[9:25], engramID[:])
+	return key
+}
+
 // CoOccurrenceKey constructs the entity co-occurrence index key (0x24 prefix).
 // Tracks how many times two entities appear in the same engram within a vault.
 // Key: 0x24 | wsPrefix(8) | nameHashA(8) | nameHashB(8) = 25 bytes
@@ -668,6 +682,30 @@ func IdempotencyKey(opID string) []byte {
 	return key
 }
 
+// RelEntityIndexKey constructs the relationship entity index key (0x26 prefix).
+// Written for BOTH fromEntity and toEntity on every UpsertRelationshipRecord call.
+// Enables O(engrams-referencing-entity) relationship lookup instead of a full vault scan.
+// Key: 0x26 | ws(8) | entityHash(8) | engramID(16) = 33 bytes
+// Value: empty (all data is encoded in the key).
+func RelEntityIndexKey(ws [8]byte, entityHash [8]byte, engramID [16]byte) []byte {
+	key := make([]byte, 1+8+8+16)
+	key[0] = 0x26
+	copy(key[1:9], ws[:])
+	copy(key[9:17], entityHash[:])
+	copy(key[17:33], engramID[:])
+	return key
+}
+
+// RelEntityIndexPrefix returns the 17-byte prefix for scanning all relationship
+// engrams for a given entity in a vault (0x26 | ws(8) | entityHash(8)).
+func RelEntityIndexPrefix(ws [8]byte, entityHash [8]byte) []byte {
+	key := make([]byte, 1+8+8)
+	key[0] = 0x26
+	copy(key[1:9], ws[:])
+	copy(key[9:17], entityHash[:])
+	return key
+}
+
 // ArchiveAssocKey constructs the archived association key (0x25 prefix).
 // No weight complement — archive keys are not sorted by weight.
 // No reverse key — restore is one-directional (BFS always traverses outbound edges).
@@ -713,4 +751,27 @@ func ArchiveAssocRangeEnd(ws [8]byte) []byte {
 		}
 	}
 	return end
+}
+
+// DreamStateKey returns the 9-byte Pebble key for per-vault dream state.
+// Key layout: [0x27][8-byte vault prefix]
+// Value layout: 16 bytes (last_dream_at int64 + engrams_at_dream int64, BigEndian)
+func DreamStateKey(vaultPrefix [8]byte) []byte {
+	key := make([]byte, 9)
+	key[0] = 0x27
+	copy(key[1:], vaultPrefix[:])
+	return key
+}
+
+// ContentHashKey constructs the content-hash dedup index key (0x28 prefix).
+// Maps a SHA-256 content hash to the engram ID within a vault, enabling O(1)
+// exact-duplicate detection at write time.
+// Key: 0x28 | wsPrefix(8) | sha256(32) = 41 bytes
+// Value: engramID(16) bytes
+func ContentHashKey(ws [8]byte, hash [32]byte) []byte {
+	key := make([]byte, 1+8+32)
+	key[0] = 0x28
+	copy(key[1:9], ws[:])
+	copy(key[9:41], hash[:])
+	return key
 }

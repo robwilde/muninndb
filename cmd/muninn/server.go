@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/scrypster/muninndb/internal/audit"
 	"github.com/scrypster/muninndb/internal/auth"
 	"github.com/scrypster/muninndb/internal/backup"
 	"github.com/scrypster/muninndb/internal/cognitive"
@@ -187,6 +188,43 @@ func resolveEnrichInfo(cfg plugincfg.PluginConfig) rest.EnrichInfo {
 	return rest.EnrichInfo{}
 }
 
+// injectOpenAIBaseURL injects openAIOverride (the value of MUNINN_OPENAI_URL) as
+// a base_url query param into an openai:// enrich URL, mirroring how the embed
+// provider handles the same env var. No-ops when:
+//   - enrichURL is not an openai:// URL
+//   - enrichURL already has an explicit base_url param
+//   - openAIOverride is empty or resolves to the default api.openai.com
+func injectOpenAIBaseURL(enrichURL, openAIOverride string) string {
+	if !strings.HasPrefix(strings.ToLower(enrichURL), "openai://") {
+		return enrichURL
+	}
+	parsed, err := neturl.Parse(enrichURL)
+	if err != nil || parsed.Query().Get("base_url") != "" {
+		return enrichURL
+	}
+	if openAIOverride == "" {
+		return enrichURL
+	}
+	// If MUNINN_OPENAI_URL is itself an openai:// URL, extract its base_url param.
+	// If it's a plain http(s) URL, use it directly as the base URL.
+	baseURL := openAIOverride
+	if strings.HasPrefix(strings.ToLower(openAIOverride), "openai://") {
+		p, err := neturl.Parse(openAIOverride)
+		if err != nil {
+			return enrichURL
+		}
+		b := p.Query().Get("base_url")
+		if b == "" {
+			return enrichURL // openai:// with no base_url = default api.openai.com, nothing to inject
+		}
+		baseURL = b
+	}
+	q := parsed.Query()
+	q.Set("base_url", baseURL)
+	parsed.RawQuery = q.Encode()
+	return parsed.String()
+}
+
 // resolveOpenAIEmbedProviderURL resolves an OpenAI embed URL override into a
 // provider URL that ParseProviderURL can handle. Supports both:
 //   - openai://text-embedding-3-small?base_url=http://localhost:8080
@@ -219,6 +257,49 @@ func sanitizeProviderURLForLog(providerURL string) string {
 		return parsed.String()
 	}
 	return providerURL
+}
+
+// buildAuditLogger constructs the audit.Logger from env config and data dir.
+// Returns nil only if all sinks fail to initialize.
+// The file sink is enabled by default (MUNINN_AUDIT_FILE="-" to disable).
+func buildAuditLogger(dataDir string) *audit.Logger {
+	cfg := audit.ConfigFromEnv(dataDir)
+	var sinks []audit.Sink
+
+	if cfg.FilePath != "" {
+		fs, err := audit.NewFileSink(cfg.FilePath)
+		if err != nil {
+			slog.Warn("audit: file sink disabled", "path", cfg.FilePath, "err", err)
+		} else {
+			sinks = append(sinks, fs)
+			slog.Info("audit: writing to file", "path", cfg.FilePath)
+		}
+	}
+
+	if cfg.Stdout {
+		sinks = append(sinks, audit.NewStdoutSink())
+		slog.Info("audit: stdout sink enabled")
+	}
+
+	if cfg.Syslog {
+		ss, err := audit.NewSyslogSink()
+		if err != nil {
+			slog.Warn("audit: syslog sink disabled", "err", err)
+		} else {
+			sinks = append(sinks, ss)
+			slog.Info("audit: syslog sink enabled")
+		}
+	}
+
+	if cfg.WebhookURL != "" {
+		sinks = append(sinks, audit.NewWebhookSink(cfg.WebhookURL, 0))
+		slog.Info("audit: webhook sink enabled", "url", cfg.WebhookURL)
+	}
+
+	if len(sinks) == 0 {
+		return nil
+	}
+	return audit.New(audit.Config{BufferSize: cfg.BufferSize}, sinks...)
 }
 
 func openAIEmbedLogAttrs(providerURL string) []any {
@@ -339,8 +420,16 @@ func buildEmbedder(ctx context.Context, cfg plugincfg.PluginConfig, dataDir stri
 	}
 
 	// 2. Saved config fallback
-	if cfg.EmbedProvider != "" && cfg.EmbedProvider != "none" && cfg.EmbedProvider != "local" {
+	if cfg.EmbedProvider != "" && cfg.EmbedProvider != "none" {
 		switch cfg.EmbedProvider {
+		case "local":
+			if os.Getenv(localEmbed) != "0" && embedpkg.LocalAvailable() {
+				slog.Info("initializing bundled local ONNX embedder from saved config", "data_dir", dataDir)
+				if svc := tryEmbedService("local://all-MiniLM-L6-v2", plugin.PluginConfig{DataDir: dataDir}); svc != nil {
+					return embedpkg.NewEmbedServiceAdapter(svc), svc, nil
+				}
+				slog.Warn("bundled local embedder init failed (saved config), falling back")
+			}
 		case "ollama":
 			if cfg.EmbedURL != "" {
 				slog.Info("initializing Ollama embedder from saved config", "url", cfg.EmbedURL)
@@ -425,6 +514,7 @@ func buildEmbedder(ctx context.Context, cfg plugincfg.PluginConfig, dataDir stri
 //	ollama://localhost:11434/llama3.2          (local, no key required)
 //	openai://gpt-4o-mini                       (MUNINN_ENRICH_API_KEY required)
 //	anthropic://claude-haiku-4-5-20251001      (MUNINN_ANTHROPIC_KEY or MUNINN_ENRICH_API_KEY)
+//	google://gemini-1.5-flash                  (MUNINN_GOOGLE_KEY or MUNINN_ENRICH_API_KEY)
 //
 // Returns nil without error if MUNINN_ENRICH_URL is not set — LLM enrichment
 // is optional. Logs a warning on init failure so the server starts without
@@ -447,6 +537,7 @@ func buildEnricher(ctx context.Context, cfg plugincfg.PluginConfig) plugin.Enric
 		return nil
 	}
 
+	enrichURL = injectOpenAIBaseURL(enrichURL, strings.TrimSpace(os.Getenv("MUNINN_OPENAI_URL")))
 	slog.Info("initializing enrich plugin", "url", enrichURL)
 	svc, err := enrichpkg.NewEnrichService(enrichURL)
 	if err != nil {
@@ -458,6 +549,9 @@ func buildEnricher(ctx context.Context, cfg plugincfg.PluginConfig) plugin.Enric
 	apiKey := os.Getenv("MUNINN_ENRICH_API_KEY")
 	if apiKey == "" {
 		apiKey = os.Getenv("MUNINN_ANTHROPIC_KEY")
+	}
+	if apiKey == "" {
+		apiKey = os.Getenv("MUNINN_GOOGLE_KEY")
 	}
 	if apiKey == "" {
 		apiKey = cfg.EnrichAPIKey // saved config fallback
@@ -535,14 +629,47 @@ func runStartupMigrations(ctx context.Context, store *storage.PebbleStore) {
 
 // handleClusterConn reads MBP frames from an incoming cluster TCP connection
 // and dispatches them to the coordinator. Exits when the connection is closed.
+//
+// Protocol: the first frame MUST be TypeJoinRequest. On success, ownership of
+// conn transfers to the PeerConn inside ConnManager (HandleIncomingJoin →
+// RegisterConn). After that, this goroutine no longer closes conn on exit —
+// the coordinator's cleanup owns it. If the join fails or a protocol violation
+// occurs, this goroutine closes conn via the deferred call.
 func handleClusterConn(conn net.Conn, coord *replication.ClusterCoordinator) {
-	defer conn.Close()
+	// connOwned flips to false once HandleIncomingJoin succeeds and the
+	// PeerConn takes ownership, preventing a double-close on goroutine exit.
+	connOwned := true
+	defer func() {
+		if connOwned {
+			conn.Close()
+		}
+	}()
+
+	fromNodeID := conn.RemoteAddr().String() // ephemeral until join completes
+	joined := false
+
 	for {
 		frame, err := mbp.ReadFrame(conn)
 		if err != nil {
 			return // connection closed or error
 		}
-		fromNodeID := conn.RemoteAddr().String()
+		if frame.Type == mbp.TypeJoinRequest {
+			nodeID, err := coord.HandleIncomingJoin(conn, frame.Payload)
+			if err != nil {
+				log.Printf("[cluster] join error from %s: %v", fromNodeID, err)
+				return
+			}
+			fromNodeID = nodeID
+			joined = true
+			connOwned = false // PeerConn now owns conn
+			continue
+		}
+		// Reject any frame that arrives before the join handshake completes.
+		// A well-behaved Lobe always sends TypeJoinRequest first.
+		if !joined {
+			log.Printf("[cluster] unexpected frame type 0x%02x from %s before join; closing", frame.Type, fromNodeID)
+			return
+		}
 		if err := coord.HandleIncomingFrame(fromNodeID, frame.Type, frame.Payload); err != nil {
 			log.Printf("[cluster] frame error from %s: %v", fromNodeID, err)
 		}
@@ -592,6 +719,8 @@ func parseListenHost(args []string, envVal string) string {
 }
 
 func runServer() {
+	loadEnvFile()
+
 	// Apply memory limits before any significant allocations.
 	applyMemoryLimits()
 
@@ -612,7 +741,7 @@ func runServer() {
 		uiAddrDefault = v
 	}
 	uiAddr := flag.String("ui-addr", uiAddrDefault, "Web UI HTTP listen address")
-	mcpToken := flag.String("mcp-token", "", "Bearer token override for MCP auth (leave empty to read from ~/.muninn/mcp.token)")
+	mcpToken := flag.String("mcp-token", "", "Bearer token override for MCP auth (leave empty to read from MUNINN_MCP_TOKEN env var or ~/.muninn/mcp.token)")
 	dev := flag.Bool("dev", false, "serve web assets from ./web directory (development mode)")
 	backupInterval := flag.String("backup-interval", "", "Automated backup interval (e.g. 6h, 30m); empty = disabled")
 	backupDir := flag.String("backup-dir", "", "Directory to write automated backups into")
@@ -638,8 +767,12 @@ func runServer() {
 		fmt.Fprintf(os.Stderr, "  MUNINN_LOCAL_EMBED           Set to \"0\" to disable bundled ONNX embedder\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_ENRICH_URL            LLM enrichment endpoint URL (optional)\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_ENRICH_API_KEY        API key for enrichment (or MUNINN_ANTHROPIC_KEY)\n")
+		fmt.Fprintf(os.Stderr, "  MUNINN_ENRICH_TIMEOUT        Per-engram LLM timeout for replay_enrichment (e.g. 60s, 2m; default: no extra timeout)\n")
+		fmt.Fprintf(os.Stderr, "  MUNINN_HNSW_WARN_THRESHOLD_MB  Emit a warning when HNSW in-memory vector bytes exceed N MB (optional)\n")
+		fmt.Fprintf(os.Stderr, "  MUNINN_HNSW_MAX_MB             Skip HNSW insert (keep Pebble write) when memory exceeds N MB (optional)\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_LISTEN_HOST           Host to bind all servers to (e.g. 0.0.0.0 for LAN access)\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_CORS_ORIGINS          Comma-separated CORS allowed origins\n")
+		fmt.Fprintf(os.Stderr, "  MUNINN_MCP_TOKEN             Bearer token for MCP endpoint auth (Docker/compose alternative to --mcp-token)\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_MEM_LIMIT_GB          Memory limit in GB (default: 4)\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_GC_PERCENT            Go GC target percentage (default: 200)\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_RATE_LIMIT_GLOBAL_RPS Global rate limit requests/sec (default: 1000)\n")
@@ -650,8 +783,21 @@ func runServer() {
 	}
 	flag.Parse()
 
-	// MCP token: --mcp-token flag is an explicit override (tests, container entrypoints).
-	// Default path reads from ~/.muninn/mcp.token so the token never appears in `ps` output.
+	// Persist actual bound addresses so 'muninn status' and the startup health poll
+	// can probe the correct ports when non-default --*-addr flags are used.
+	_ = writeAddrsFile(*dataDir, daemonAddrs{
+		RestAddr: *restAddr,
+		MCPAddr:  *mcpAddr,
+		UIAddr:   *uiAddr,
+	})
+
+	// MCP token resolution order (highest to lowest priority):
+	//   1. --mcp-token flag  — explicit override for tests / container entrypoints
+	//   2. MUNINN_MCP_TOKEN env var — preferred for Docker / docker-compose deployments
+	//   3. ~/.muninn/mcp.token file — keeps the token out of `ps` output on bare-metal
+	if *mcpToken == "" {
+		*mcpToken = os.Getenv("MUNINN_MCP_TOKEN")
+	}
 	if *mcpToken == "" {
 		*mcpToken = readTokenFile()
 	}
@@ -790,6 +936,11 @@ func runServer() {
 		Description: "backfill embed_dim in ERF records for existing embeddings",
 		Up:          migrate.BackfillEmbedDim,
 	})
+	migRunner.Register(migrate.Migration{
+		Version:     2,
+		Description: "backfill relationship entity index (0x26) for GetEntityAggregate optimisation",
+		Up:          migrate.BackfillRelEntityIndex,
+	})
 	if applied, err := migRunner.Run(); err != nil {
 		slog.Error("migration failed", "err", err)
 		db.Close()
@@ -811,8 +962,9 @@ func runServer() {
 
 	// Wire ClusterCoordinator when cluster mode is enabled.
 	var coordinator *replication.ClusterCoordinator
+	var repLog *replication.ReplicationLog
 	if clusterCfg.Enabled {
-		repLog := replication.NewReplicationLog(db)
+		repLog = replication.NewReplicationLog(db)
 		applier := replication.NewApplier(db)
 		epochStore, err := replication.NewEpochStore(db)
 		if err != nil {
@@ -862,7 +1014,14 @@ func runServer() {
 	}
 
 	// Build storage layer
-	store := storage.NewPebbleStore(db, storage.PebbleStoreConfig{CacheSize: 10000})
+	storeCfg := storage.PebbleStoreConfig{CacheSize: 10000}
+	if clusterCfg.Enabled {
+		storeCfg.RepLogAppend = func(op uint8, key, value []byte) error {
+			_, err := repLog.Append(replication.WALOp(op), key, value)
+			return err
+		}
+	}
+	store := storage.NewPebbleStore(db, storeCfg)
 
 	// Run startup migrations before the engine is built.
 	runStartupMigrations(context.Background(), store)
@@ -898,6 +1057,13 @@ func runServer() {
 
 	// Determine embedder provider and model for the status endpoint.
 	embedInfo := resolveEmbedInfo(savedPluginCfg)
+	// Wire hardware acceleration flag once at startup (captured before first request).
+	if embedPlugin != nil {
+		if h, ok := embedPlugin.(plugin.HardwareAwarePlugin); ok {
+			v := h.HardwareAccelerated()
+			embedInfo.HardwareAccelerated = &v
+		}
+	}
 
 	// Build enrich plugin (optional): env vars → saved config.
 	enrichCtx, enrichCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -906,6 +1072,31 @@ func runServer() {
 
 	// Build HNSW registry (multi-vault, lazy-loading)
 	hnswRegistry := hnswpkg.NewRegistry(db)
+
+	// Apply optional memory thresholds from environment variables.
+	//
+	//   MUNINN_HNSW_WARN_THRESHOLD_MB  – emit a throttled slog.Warn when total
+	//                                    in-memory vector bytes exceed this value
+	//                                    (no insert penalty; default: disabled).
+	//   MUNINN_HNSW_MAX_MB             – skip graph insert when total bytes meet
+	//                                    or exceed this value (vector still stored
+	//                                    in Pebble; FTS unaffected; default: disabled).
+	if warnMBStr := os.Getenv("MUNINN_HNSW_WARN_THRESHOLD_MB"); warnMBStr != "" {
+		if warnMB, err := strconv.ParseInt(warnMBStr, 10, 64); err != nil || warnMB <= 0 {
+			slog.Warn("invalid MUNINN_HNSW_WARN_THRESHOLD_MB, ignoring", "value", warnMBStr)
+		} else {
+			hnswRegistry.SetWarnThresholdBytes(warnMB << 20)
+			slog.Info("hnsw: memory warn threshold configured", "warn_threshold_mb", warnMB)
+		}
+	}
+	if maxMBStr := os.Getenv("MUNINN_HNSW_MAX_MB"); maxMBStr != "" {
+		if maxMB, err := strconv.ParseInt(maxMBStr, 10, 64); err != nil || maxMB <= 0 {
+			slog.Warn("invalid MUNINN_HNSW_MAX_MB, ignoring", "value", maxMBStr)
+		} else {
+			hnswRegistry.SetMaxBytes(maxMB << 20)
+			slog.Info("hnsw: hard memory limit configured", "max_mb", maxMB)
+		}
+	}
 
 	// Build activation engine
 	actEngine := activation.New(store, activation.NewFTSAdapter(ftsIndex), activation.NewHNSWAdapter(hnswRegistry), embedder)
@@ -926,10 +1117,18 @@ func runServer() {
 	actEngine.SetTransitionStore(store.TransitionCache())
 
 	// Build engine API - pass the full worker implementations
-	eng := engine.NewEngine(store, authStore, ftsIndex, actEngine, trigSystem,
-		hebbianWorkerImpl,
-		contradictWorkerImpl.Worker, confidenceWorkerImpl.Worker,
-		embedder, hnswRegistry)
+	eng := engine.NewEngine(engine.EngineConfig{
+		Store:            store,
+		AuthStore:        authStore,
+		FTSIndex:         ftsIndex,
+		ActivationEngine: actEngine,
+		TriggerSystem:    trigSystem,
+		HebbianWorker:    hebbianWorkerImpl,
+		ContradictWorker: contradictWorkerImpl.Worker,
+		ConfidenceWorker: confidenceWorkerImpl.Worker,
+		Embedder:         embedder,
+		HNSWRegistry:     hnswRegistry,
+	})
 
 	eng.SetTransitionWorker(transitionWorkerImpl)
 
@@ -994,8 +1193,26 @@ func runServer() {
 			slog.Warn("failed to register enrich plugin in registry", "err", err)
 		}
 		eng.SetEnrichPlugin(enrichPlugin)
+		if timeoutStr := os.Getenv("MUNINN_ENRICH_TIMEOUT"); timeoutStr != "" {
+			if d, err := time.ParseDuration(timeoutStr); err == nil && d > 0 {
+				eng.SetReplayEnrichTimeout(d)
+				slog.Info("replay enrichment per-engram timeout configured", "timeout", d)
+			} else if err != nil {
+				slog.Warn("MUNINN_ENRICH_TIMEOUT invalid, ignoring", "value", timeoutStr, "err", err)
+			}
+		}
 		if rew, ok := restWrapper.(*rest.RESTEngineWrapper); ok {
 			rew.SetEnricher(enrichPlugin)
+		}
+		// Wire circuit-breaker state-change hook so transitions emit structured
+		// log lines and update the plugin registry health status.
+		if es, ok := enrichPlugin.(interface {
+			SetBreakerStateChangeHook(interface {
+				SetHealthy(name string, healthy bool)
+				SetUnhealthy(name string, err error)
+			})
+		}); ok {
+			es.SetBreakerStateChangeHook(pluginRegistry)
 		}
 	}
 
@@ -1010,6 +1227,11 @@ func runServer() {
 	})
 	restServer.SetVersion(muninnVersion())
 
+	auditLogger := buildAuditLogger(*dataDir)
+	if auditLogger != nil {
+		restServer.SetAuditLogger(auditLogger)
+	}
+
 	// Shared plugin store — bridges raw storage to the plugin.PluginStore interface.
 	// Created here so it can be shared by the MCP adapter (RetryEnrich) and both
 	// retroactive processors (embed + enrich) which are started below.
@@ -1017,7 +1239,7 @@ func runServer() {
 
 	// Build MCP server
 	mcpAdapter := mcp.NewEngineAdapter(eng, enrichPlugin, pStore)
-	mcpServer := mcp.New(*mcpAddr, mcpAdapter, *mcpToken, clientTLS)
+	mcpServer := mcp.New(*mcpAddr, mcpAdapter, *mcpToken, authStore, clientTLS)
 
 	// Build gRPC server
 	grpcAdapter := grpcpkg.NewEngineAdapter(eng)
@@ -1195,6 +1417,9 @@ func runServer() {
 		slog.Error("create ui server", "err", err)
 		os.Exit(1)
 	}
+	if auditLogger != nil {
+		uiSrv.SetAuditLogger(auditLogger)
+	}
 	// Wire broadcast callback now that uiSrv is available.
 	ring.SetOnAdd(func(e logging.LogEntry) {
 		data, _ := json.Marshal(map[string]any{
@@ -1276,6 +1501,9 @@ func runServer() {
 		}
 		if err := uiSrv.Stop(netShutCtx); err != nil {
 			slog.Error("ui server shutdown error", "err", err)
+		}
+		if auditLogger != nil {
+			_ = auditLogger.Close()
 		}
 		// Stop cluster coordinator before closing the DB (coordinator holds DB references).
 		if coordinator != nil {

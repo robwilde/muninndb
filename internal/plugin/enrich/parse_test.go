@@ -146,18 +146,46 @@ func TestParseRelationships_ValidJSON(t *testing.T) {
 // TestNormalizeEntityType tests entity type normalization and validation.
 func TestNormalizeEntityType_Valid(t *testing.T) {
 	tests := map[string]string{
+		// Known types — returned as-is after normalisation.
 		"person":       "person",
 		"PERSON":       "person",
 		"database":     "database",
 		"tool":         "tool",
-		"unknown":      "service", // should normalize to service
 		"ORGANIZATION": "organization",
+		// UI-colour-map types that were previously missing from the allowlist
+		// and were silently coerced to "service".
+		"technology": "technology",
+		"location":   "location",
+		"concept":    "concept",
+		"product":    "product",
+		"event":      "event",
+		// Unknown types are passed through (not coerced to "service").
+		"unknown":  "unknown",
+		"library":  "library",
+		"LIBRARY":  "library", // still normalised to lowercase
 	}
 
 	for input, expected := range tests {
 		result := normalizeEntityType(input)
 		if result != expected {
-			t.Fatalf("normalizeEntityType(%q): expected %q, got %q", input, expected, result)
+			t.Errorf("normalizeEntityType(%q): got %q, want %q", input, result, expected)
+		}
+	}
+}
+
+// TestNormalizeEntityType_UnknownPassThrough verifies that unknown entity types
+// are returned as their normalised string rather than silently coerced to
+// "service". This prevents data corruption when an LLM returns a valid semantic
+// type (e.g. "library", "concept", "event") that is not yet in the allowlist.
+func TestNormalizeEntityType_UnknownPassThrough(t *testing.T) {
+	unknownTypes := []string{"library", "algorithm", "protocol", "api", "config", "file"}
+	for _, typ := range unknownTypes {
+		result := normalizeEntityType(typ)
+		if result == "service" {
+			t.Errorf("normalizeEntityType(%q) = %q, must not coerce unknown types to \"service\"", typ, result)
+		}
+		if result != typ {
+			t.Errorf("normalizeEntityType(%q) = %q, want pass-through %q", typ, result, typ)
 		}
 	}
 }
@@ -307,6 +335,64 @@ func TestExtractJSON_PlainCodeFences(t *testing.T) {
 	extracted := extractJSON(raw)
 	if !contains(extracted, `"key"`) {
 		t.Fatalf("failed to extract from plain code fences: %q", extracted)
+	}
+}
+
+// TestExtractJSON_DuplicateOutput covers models (e.g. llama3.2) that repeat
+// their JSON output in a single completion. The parser must return only the
+// first complete object and ignore everything after it.
+func TestExtractJSON_DuplicateOutput(t *testing.T) {
+	raw := `{"entities": [{"name": "foo", "type": "tool"}]} {"entities": [{"name": "bar", "type": "tool"}]}`
+	extracted := extractJSON(raw)
+	// Must stop at the end of the first object — second object must not appear.
+	if contains(extracted, `"bar"`) {
+		t.Fatalf("extractJSON grabbed both duplicate objects: %q", extracted)
+	}
+	if !contains(extracted, `"foo"`) {
+		t.Fatalf("extractJSON dropped the first object: %q", extracted)
+	}
+}
+
+// TestParseEntityResponse_DuplicateOutput is the end-to-end version of the
+// above: ParseEntityResponse must succeed and return only the first object's
+// entities when the LLM repeats itself.
+func TestParseEntityResponse_DuplicateOutput(t *testing.T) {
+	raw := `{"entities": [{"name": "fb-automate", "type": "tool", "confidence": 1.0}]} {"entities": [{"name": "reply-comment", "type": "project", "confidence": 0.7}]}`
+	entities, err := ParseEntityResponse(raw)
+	if err != nil {
+		t.Fatalf("ParseEntityResponse failed on duplicate output: %v", err)
+	}
+	if len(entities) != 1 {
+		t.Fatalf("expected 1 entity from first object, got %d: %+v", len(entities), entities)
+	}
+	if entities[0].Name != "fb-automate" {
+		t.Fatalf("expected 'fb-automate', got %q", entities[0].Name)
+	}
+}
+
+// TestParseSummarizeResponse_DuplicateOutput ensures summarization parsing
+// handles the llama3.2 duplicate-output pattern.
+func TestParseSummarizeResponse_DuplicateOutput(t *testing.T) {
+	raw := `{"summary": "first summary", "key_points": ["point A"]} {"summary": "second summary", "key_points": ["point B"]}`
+	summary, keyPoints, err := ParseSummarizeResponse(raw)
+	if err != nil {
+		t.Fatalf("ParseSummarizeResponse failed on duplicate output: %v", err)
+	}
+	if summary != "first summary" {
+		t.Fatalf("expected 'first summary', got %q", summary)
+	}
+	if len(keyPoints) != 1 || keyPoints[0] != "point A" {
+		t.Fatalf("expected ['point A'], got %v", keyPoints)
+	}
+}
+
+// TestExtractJSON_BracketInsideString ensures brackets inside quoted strings
+// do not confuse the depth counter.
+func TestExtractJSON_BracketInsideString(t *testing.T) {
+	raw := `{"key": "value with } brace and { another"}`
+	extracted := extractJSON(raw)
+	if extracted != raw {
+		t.Fatalf("extractJSON mangled JSON with brackets in string: %q", extracted)
 	}
 }
 

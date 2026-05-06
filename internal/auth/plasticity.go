@@ -51,6 +51,23 @@ type PlasticityConfig struct {
 	// RecallMode is the default recall mode for this vault: "semantic"|"recent"|"balanced"|"deep".
 	// nil = use "balanced" (engine defaults).
 	RecallMode *string `json:"recall_mode,omitempty"`
+
+	// ScoringFusion selects the Phase 6 scoring strategy.
+	// "rrf" = use Phase 3 RRF scores directly (rank-based, scale-invariant).
+	// "weighted_sum" = use legacy weighted-sum scoring (DisableACTR implied).
+	// nil/empty = default (ACT-R scoring, unchanged behavior).
+	ScoringFusion *string `json:"scoring_fusion,omitempty"`
+
+	// Long-Term Potentiation (LTP) for Hebbian associations.
+	// Associations co-activated beyond LTPThreshold become potentiated,
+	// enforcing a higher weight floor that resists decay.
+	// All zero/nil = disabled (backward compatible).
+	LTPThreshold   *int     `json:"ltp_threshold,omitempty"`    // co-activation count to trigger LTP (0 = disabled)
+	LTPWeightFloor *float32 `json:"ltp_weight_floor,omitempty"` // minimum weight for potentiated edges (0–1; 0 = disabled)
+
+	// ExcludeUntrusted controls whether untrusted engrams are filtered from ACTIVATE results.
+	// nil = false (default: include all engrams regardless of trust).
+	ExcludeUntrusted *bool `json:"exclude_untrusted,omitempty"`
 }
 
 // ResolvedPlasticity is the fully-merged configuration after applying preset defaults
@@ -95,6 +112,13 @@ type ResolvedPlasticity struct {
 	EnrichmentEnabled bool `json:"enrichment_enabled"`
 	// RecallMode is the default recall mode for this vault.
 	RecallMode string `json:"recall_mode"`
+	// ScoringFusion selects Phase 6 scoring strategy: "" (default=ACT-R), "rrf", or "weighted_sum".
+	ScoringFusion string `json:"scoring_fusion"`
+	// LTP (Long-Term Potentiation) resolved values. Zero = disabled.
+	LTPThreshold   int     `json:"ltp_threshold"`
+	LTPWeightFloor float32 `json:"ltp_weight_floor"`
+	// ExcludeUntrusted: when true, ACTIVATE silently skips engrams with TrustUntrusted.
+	ExcludeUntrusted bool `json:"exclude_untrusted"`
 }
 
 type plasticityPreset struct {
@@ -123,6 +147,9 @@ type plasticityPreset struct {
 	InlineEnrichment  string
 	EnrichmentEnabled bool
 	RecallMode        string
+	ScoringFusion     string // "" = default (ACT-R), "rrf", "weighted_sum"
+	LTPThreshold      int
+	LTPWeightFloor    float32
 }
 
 var plasticityPresets = map[string]plasticityPreset{
@@ -151,6 +178,7 @@ var plasticityPresets = map[string]plasticityPreset{
 		InlineEnrichment:     "caller_preferred",
 		EnrichmentEnabled:    true,
 		RecallMode:           "balanced",
+
 	},
 	"reference": {
 		HebbianEnabled:       true,
@@ -177,6 +205,7 @@ var plasticityPresets = map[string]plasticityPreset{
 		InlineEnrichment:     "caller_preferred",
 		EnrichmentEnabled:    true,
 		RecallMode:           "balanced",
+
 	},
 	"scratchpad": {
 		HebbianEnabled:       false,
@@ -203,6 +232,7 @@ var plasticityPresets = map[string]plasticityPreset{
 		InlineEnrichment:     "caller_preferred",
 		EnrichmentEnabled:    true,
 		RecallMode:           "balanced",
+
 	},
 	"knowledge-graph": {
 		HebbianEnabled:       true,
@@ -229,6 +259,7 @@ var plasticityPresets = map[string]plasticityPreset{
 		InlineEnrichment:     "caller_preferred",
 		EnrichmentEnabled:    true,
 		RecallMode:           "balanced",
+
 	},
 }
 
@@ -270,6 +301,9 @@ func ResolvePlasticity(cfg *PlasticityConfig) ResolvedPlasticity {
 		InlineEnrichment:     p.InlineEnrichment,
 		EnrichmentEnabled:    p.EnrichmentEnabled,
 		RecallMode:           p.RecallMode,
+		ScoringFusion:        p.ScoringFusion,
+		LTPThreshold:         p.LTPThreshold,
+		LTPWeightFloor:       p.LTPWeightFloor,
 	}
 
 	if cfg == nil {
@@ -426,7 +460,34 @@ func ResolvePlasticity(cfg *PlasticityConfig) ResolvedPlasticity {
 	if cfg.RecallMode != nil && ValidRecallMode(*cfg.RecallMode) {
 		r.RecallMode = *cfg.RecallMode
 	}
-
+	if cfg.ScoringFusion != nil {
+		if ValidScoringFusion(*cfg.ScoringFusion) {
+			r.ScoringFusion = *cfg.ScoringFusion
+		} else {
+			r.ScoringFusion = "" // invalid → default (ACT-R)
+		}
+	}
+	if cfg.ExcludeUntrusted != nil {
+		r.ExcludeUntrusted = *cfg.ExcludeUntrusted
+	}
+	// LTP overrides
+	if cfg.LTPThreshold != nil {
+		v := *cfg.LTPThreshold
+		if v < 0 {
+			v = 0
+		}
+		r.LTPThreshold = v
+	}
+	if cfg.LTPWeightFloor != nil {
+		v := float32(*cfg.LTPWeightFloor)
+		if v < 0 {
+			v = 0
+		}
+		if v > 1 {
+			v = 1
+		}
+		r.LTPWeightFloor = v
+	}
 	return r
 }
 
@@ -465,4 +526,14 @@ func ValidRecallMode(s string) bool {
 func ValidPlasticityPreset(s string) bool {
 	_, ok := plasticityPresets[s]
 	return ok
+}
+
+// ValidScoringFusion returns true if s is a known scoring fusion mode.
+// Empty string is valid (means "use default ACT-R scoring").
+func ValidScoringFusion(s string) bool {
+	switch s {
+	case "", "rrf", "weighted_sum":
+		return true
+	}
+	return false
 }

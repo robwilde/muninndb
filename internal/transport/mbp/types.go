@@ -100,6 +100,7 @@ type WriteRequest struct {
 type WriteResponse struct {
 	ID        string `msgpack:"id"         json:"id"`
 	CreatedAt int64  `msgpack:"created_at" json:"created_at"`
+	Hint      string `msgpack:"hint,omitempty" json:"hint,omitempty"`
 }
 
 // ReadRequest retrieves an engram by ID.
@@ -130,6 +131,16 @@ type ReadResponse struct {
 	// EmbedDim is the stored embedding dimensionality code (0 = no embedding).
 	// 1 = 384-dim, 2 = 768-dim, 3 = 1536-dim.
 	EmbedDim uint8 `msgpack:"embed_dim,omitempty" json:"embed_dim,omitempty"`
+	// Trust is the TrustLevel uint8 (0=unset/inferred, 1=verified, 2=inferred, 3=external, 4=untrusted).
+	// omitempty is intentional: TrustUnset(0x00) and TrustInferred(0x02) both render as "inferred"
+	// in the MCP layer, and legacy records (pre-trust) written as 0x00 are treated as inferred.
+	// Clients should treat an absent trust field as equivalent to TrustUnset (0x00).
+	Trust uint8 `msgpack:"trust,omitempty" json:"trust,omitempty"`
+
+	// Entities and EntityRelationships are populated by muninn_read to expose what
+	// was stored via inline enrichment. Empty when no entities/relationships were linked.
+	Entities            []InlineEntity             `msgpack:"entities,omitempty"              json:"entities,omitempty"`
+	EntityRelationships []InlineEntityRelationship `msgpack:"entity_relationships,omitempty"  json:"entity_relationships,omitempty"`
 }
 
 // ActivateRequest queries for relevant engrams.
@@ -212,7 +223,9 @@ type ActivationItem struct {
 	LastAccess      int64           `msgpack:"last_access,omitempty"       json:"last_access,omitempty"`
 	AccessCount     uint32          `msgpack:"access_count,omitempty"      json:"access_count,omitempty"`
 	Relevance       float32         `msgpack:"relevance,omitempty"         json:"relevance,omitempty"`
-	SourceType      string          `msgpack:"source_type,omitempty"       json:"source_type,omitempty"`
+	SourceType string `msgpack:"source_type,omitempty" json:"source_type,omitempty"`
+	// Trust is the TrustLevel uint8. omitempty intentional — see ReadResponse.Trust comment.
+	Trust uint8 `msgpack:"trust,omitempty" json:"trust,omitempty"`
 }
 
 // ScoreComponents breaks down the activation score.

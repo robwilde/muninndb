@@ -36,6 +36,10 @@ func TestHandleRPC_Initialize(t *testing.T) {
 	if _, ok := result["protocolVersion"]; !ok {
 		t.Error("response missing 'protocolVersion'")
 	}
+	instr, ok := result["instructions"].(string)
+	if !ok || instr == "" {
+		t.Error("response missing 'instructions'")
+	}
 }
 
 func TestHandleRPC_Ping(t *testing.T) {
@@ -101,16 +105,18 @@ func TestDispatchToolCall_NilArguments(t *testing.T) {
 	}
 }
 
-func TestDispatchToolCall_InvalidVaultFallsBackToDefault(t *testing.T) {
-	// An invalid vault name in args is treated as absent and falls back to "default".
-	// This exercises the vaultFromArgs invalid-name path; the call still succeeds.
+func TestDispatchToolCall_InvalidVaultReturnsError(t *testing.T) {
+	// An invalid vault name in args is now rejected (fail-closed) instead of
+	// silently falling back to "default".
 	srv := newTestServer()
 	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_status","arguments":{"vault":"INVALID VAULT!"}}}`
 	w := postRPC(t, srv, body)
 	resp := decodeResp(t, w.Body.String())
-	// Should succeed because resolveVault falls back to "default" when vault is invalid.
-	if resp.Error != nil {
-		t.Errorf("expected fallback to default vault to succeed, got error: %v", resp.Error)
+	if resp.Error == nil {
+		t.Fatal("expected error for invalid vault name, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("expected -32602 for invalid vault, got %d", resp.Error.Code)
 	}
 }
 
@@ -118,7 +124,7 @@ func TestDispatchToolCall_InvalidVaultFallsBackToDefault(t *testing.T) {
 
 func TestWithMiddleware_UnauthorizedRequest(t *testing.T) {
 	// Server with a required token — a request without the Bearer token must get 401.
-	srv := New(":0", &fakeEngine{}, "secret", nil)
+	srv := New(":0", &fakeEngine{}, "secret", nil, nil)
 	req := httptest.NewRequest("GET", "/mcp/tools", nil)
 	// No Authorization header.
 	w := httptest.NewRecorder()
@@ -130,7 +136,7 @@ func TestWithMiddleware_UnauthorizedRequest(t *testing.T) {
 
 func TestWithMiddleware_AuthorizedRequest(t *testing.T) {
 	// Correct Bearer token must succeed.
-	srv := New(":0", &fakeEngine{}, "secret", nil)
+	srv := New(":0", &fakeEngine{}, "secret", nil, nil)
 	req := httptest.NewRequest("GET", "/mcp/tools", nil)
 	req.Header.Set("Authorization", "Bearer secret")
 	w := httptest.NewRecorder()
@@ -154,7 +160,7 @@ func TestWithMiddleware_ContentLengthTooLarge(t *testing.T) {
 // ── handleStreamablePost: auth failure ───────────────────────────────────────
 
 func TestHandleStreamablePost_Unauthorized(t *testing.T) {
-	srv := New(":0", &fakeEngine{}, "secret", nil)
+	srv := New(":0", &fakeEngine{}, "secret", nil, nil)
 	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_status","arguments":{"vault":"default"}}}`
 	req := httptest.NewRequest("POST", "/mcp", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -172,7 +178,7 @@ func TestHandleStreamablePost_Unauthorized(t *testing.T) {
 func TestIsValidVaultName_TooLong(t *testing.T) {
 	// 65-char lowercase vault name must be invalid.
 	name := strings.Repeat("a", 65)
-	if isValidVaultName(name) {
+	if auth.IsValidVaultName(name) {
 		t.Error("expected isValidVaultName to return false for 65-char name")
 	}
 }
@@ -180,19 +186,19 @@ func TestIsValidVaultName_TooLong(t *testing.T) {
 func TestIsValidVaultName_MaxLength(t *testing.T) {
 	// 64-char lowercase vault name must be valid.
 	name := strings.Repeat("a", 64)
-	if !isValidVaultName(name) {
+	if !auth.IsValidVaultName(name) {
 		t.Error("expected isValidVaultName to return true for 64-char name")
 	}
 }
 
 func TestIsValidVaultName_Empty(t *testing.T) {
-	if isValidVaultName("") {
+	if auth.IsValidVaultName("") {
 		t.Error("expected isValidVaultName to return false for empty string")
 	}
 }
 
 func TestIsValidVaultName_Uppercase(t *testing.T) {
-	if isValidVaultName("MyVault") {
+	if auth.IsValidVaultName("MyVault") {
 		t.Error("expected isValidVaultName to return false for uppercase chars")
 	}
 }
@@ -200,43 +206,42 @@ func TestIsValidVaultName_Uppercase(t *testing.T) {
 func TestIsValidVaultName_ValidChars(t *testing.T) {
 	cases := []string{"default", "my-vault", "vault_1", "a0-b_c"}
 	for _, name := range cases {
-		if !isValidVaultName(name) {
+		if !auth.IsValidVaultName(name) {
 			t.Errorf("expected isValidVaultName to return true for %q", name)
 		}
 	}
 }
 
 func TestVaultFromArgs_NonStringType(t *testing.T) {
-	// vault value that is not a string should return ("", false).
+	// vault value that is not a string should return ("", false, true).
 	args := map[string]any{"vault": 42}
-	v, ok := vaultFromArgs(args)
-	if ok || v != "" {
-		t.Errorf("expected ('', false) for non-string vault, got (%q, %v)", v, ok)
+	v, ok, invalid := vaultFromArgs(args)
+	if ok || v != "" || !invalid {
+		t.Errorf("expected ('', false, true) for non-string vault, got (%q, %v, %v)", v, ok, invalid)
 	}
 }
 
 func TestVaultFromArgs_EmptyString(t *testing.T) {
 	args := map[string]any{"vault": ""}
-	v, ok := vaultFromArgs(args)
-	if ok || v != "" {
-		t.Errorf("expected ('', false) for empty vault string, got (%q, %v)", v, ok)
+	v, ok, invalid := vaultFromArgs(args)
+	if ok || v != "" || !invalid {
+		t.Errorf("expected ('', false, true) for empty vault string, got (%q, %v, %v)", v, ok, invalid)
 	}
 }
 
 func TestVaultFromArgs_InvalidName(t *testing.T) {
-	// Vault name with invalid characters returns ("", false).
+	// Vault name with invalid characters returns ("", false, true).
 	args := map[string]any{"vault": "INVALID!"}
-	v, ok := vaultFromArgs(args)
-	if ok || v != "" {
-		t.Errorf("expected ('', false) for invalid vault name, got (%q, %v)", v, ok)
+	v, ok, invalid := vaultFromArgs(args)
+	if ok || v != "" || !invalid {
+		t.Errorf("expected ('', false, true) for invalid vault name, got (%q, %v, %v)", v, ok, invalid)
 	}
 }
 
 // ── resolveVault with session ─────────────────────────────────────────────────
 
 func TestResolveVault_SessionPinned_ArgAbsent(t *testing.T) {
-	sess := &mcpSession{vault: "work"}
-	vault, errMsg := resolveVault(sess, map[string]any{})
+	vault, errMsg := resolveVault("work", map[string]any{})
 	if errMsg != "" {
 		t.Errorf("expected no error, got: %s", errMsg)
 	}
@@ -246,8 +251,7 @@ func TestResolveVault_SessionPinned_ArgAbsent(t *testing.T) {
 }
 
 func TestResolveVault_SessionPinned_ArgMatches(t *testing.T) {
-	sess := &mcpSession{vault: "work"}
-	vault, errMsg := resolveVault(sess, map[string]any{"vault": "work"})
+	vault, errMsg := resolveVault("work", map[string]any{"vault": "work"})
 	if errMsg != "" {
 		t.Errorf("expected no error, got: %s", errMsg)
 	}
@@ -257,8 +261,7 @@ func TestResolveVault_SessionPinned_ArgMatches(t *testing.T) {
 }
 
 func TestResolveVault_SessionPinned_ArgMismatch(t *testing.T) {
-	sess := &mcpSession{vault: "work"}
-	_, errMsg := resolveVault(sess, map[string]any{"vault": "personal"})
+	_, errMsg := resolveVault("work", map[string]any{"vault": "personal"})
 	if errMsg == "" {
 		t.Error("expected vault mismatch error, got empty")
 	}
@@ -268,7 +271,7 @@ func TestResolveVault_SessionPinned_ArgMismatch(t *testing.T) {
 }
 
 func TestResolveVault_NoSession_NoArg(t *testing.T) {
-	vault, errMsg := resolveVault(nil, map[string]any{})
+	vault, errMsg := resolveVault("", map[string]any{})
 	if errMsg != "" {
 		t.Errorf("expected no error, got: %s", errMsg)
 	}

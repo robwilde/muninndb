@@ -41,7 +41,11 @@ func generateGuide(vaultName string, resolved auth.ResolvedPlasticity, stats eng
 		b.WriteString("Remember: decisions and their rationale, user preferences, errors and their fixes, ")
 		b.WriteString("project context, important facts, and anything the user might need later. ")
 		b.WriteString("Before starting any task, recall relevant memories. ")
-		b.WriteString("After completing work, remember key outcomes.\n")
+		b.WriteString("After completing work, remember key outcomes.\n\n")
+		b.WriteString("**Session start pattern:** At the start of every session, call recall twice:\n")
+		b.WriteString("1. `muninn_recall(context=[\"session start\"], mode=\"recent\")` — restores recent continuity regardless of topic.\n")
+		b.WriteString("2. Once the user provides context, call `muninn_recall(context=[<user topic>])` for semantic relevance.\n")
+		b.WriteString("Alternatively, use `muninn_where_left_off` — it is purpose-built for session resumption.\n")
 	}
 
 	// Enrichment guidance based on behavior mode + inline enrichment setting
@@ -67,7 +71,8 @@ func generateGuide(vaultName string, resolved auth.ResolvedPlasticity, stats eng
 	b.WriteString("\n## Available Tools\n\n")
 	b.WriteString("- **muninn_remember** — Store a new memory\n")
 	b.WriteString("- **muninn_remember_batch** — Store multiple memories at once (max 50)\n")
-	b.WriteString("- **muninn_recall** — Search memories by semantic context\n")
+	b.WriteString("- **muninn_recall** — Search memories by semantic context (use mode='recent' at session start)\n")
+	b.WriteString("- **muninn_where_left_off** — Resume a previous session; returns recent activity summary\n")
 	b.WriteString("- **muninn_read** — Fetch a single memory by ID\n")
 	b.WriteString("- **muninn_forget** — Soft-delete a memory\n")
 	b.WriteString("- **muninn_link** — Create associations between memories\n")
@@ -92,6 +97,9 @@ func generateGuide(vaultName string, resolved auth.ResolvedPlasticity, stats eng
 	fmt.Fprintf(&b, "- Memories stored: %d\n", stats.EngramCount)
 	fmt.Fprintf(&b, "- Behavior mode: %s\n", resolved.BehaviorMode)
 	fmt.Fprintf(&b, "- Hebbian learning: %s\n", enabledStr(resolved.HebbianEnabled))
+	if resolved.LTPThreshold > 0 {
+		fmt.Fprintf(&b, "- Hebbian LTP: enabled (threshold %d, weight floor %.2f)\n", resolved.LTPThreshold, resolved.LTPWeightFloor)
+	}
 	fmt.Fprintf(&b, "- Predictive activation (PAS): %s\n", enabledStr(resolved.PredictiveActivation))
 	fmt.Fprintf(&b, "- Graph hop depth: %d\n", resolved.HopDepth)
 	fmt.Fprintf(&b, "- Temporal decay: %s\n", enabledStr(resolved.TemporalEnabled))
@@ -101,6 +109,13 @@ func generateGuide(vaultName string, resolved auth.ResolvedPlasticity, stats eng
 	}
 	if resolved.RetentionDays > 0 {
 		fmt.Fprintf(&b, "- Retention: %.0f days\n", resolved.RetentionDays)
+	}
+	if resolved.ScoringFusion == "rrf" {
+		fmt.Fprintf(&b, "- Scoring fusion: RRF (rank-based, scale-invariant)\n")
+	} else if resolved.ScoringFusion == "weighted_sum" {
+		fmt.Fprintf(&b, "- Scoring fusion: weighted sum\n")
+	} else {
+		fmt.Fprintf(&b, "- Scoring fusion: ACT-R (default)\n")
 	}
 
 	// Memory quality guidance
@@ -145,6 +160,8 @@ func generateGuide(vaultName string, resolved auth.ResolvedPlasticity, stats eng
 
 	// Tips
 	b.WriteString("\n## Tips\n\n")
+	b.WriteString("- Use muninn_where_left_off at session start — purpose-built for resuming where you left off.\n")
+	b.WriteString("- Use muninn_recall with mode='recent' when you need continuity but lack specific context.\n")
 	b.WriteString("- Use muninn_recall with mode='deep' for thorough searches across the memory graph.\n")
 	b.WriteString("- Use muninn_link to connect related memories and strengthen the knowledge graph.\n")
 	b.WriteString("- Use muninn_decide to record decisions — they automatically link to supporting evidence.\n")

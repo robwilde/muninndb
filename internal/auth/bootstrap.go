@@ -7,9 +7,12 @@ import (
 )
 
 // Bootstrap ensures an admin user, session secret, and default vault config exist.
-// On first run, creates "root" with the default password "password", sets the
-// "default" vault to public (no API key required), and prints a reminder to
-// change the password. Subsequent runs are no-ops.
+// On first run, creates "root" with the default password "password" (or the value
+// of MUNINN_ADMIN_PASSWORD if set), sets the "default" vault to public (no API key
+// required), and prints a reminder to change the password.
+// On subsequent runs, if MUNINN_ADMIN_PASSWORD is set it is applied to the existing
+// "root" account so that containerised/automated deployments can rotate the password
+// via environment variable without a first-run wipe.
 // secretPath is where the session signing secret is persisted (e.g. dataDir/auth_secret).
 func Bootstrap(store *Store, secretPath string) (secret []byte, err error) {
 	// Load or generate session secret
@@ -25,23 +28,49 @@ func Bootstrap(store *Store, secretPath string) (secret []byte, err error) {
 		slog.Info("generated new session secret", "path", secretPath)
 	}
 
+	envPassword := os.Getenv("MUNINN_ADMIN_PASSWORD")
+
 	// Create root admin if none exists
 	if !store.AdminExists() {
-		if err = store.CreateAdmin("root", "password"); err != nil {
+		adminPassword := envPassword
+		if adminPassword == "" {
+			adminPassword = "password"
+		}
+		if err = store.CreateAdmin("root", adminPassword); err != nil {
 			return nil, fmt.Errorf("create root admin: %w", err)
 		}
 
-		fmt.Println("┌──────────────────────────────────────────────────┐")
-		fmt.Println("│            MuninnDB — First Run Setup             │")
-		fmt.Println("│                                                    │")
-		fmt.Println("│  Admin username : root                             │")
-		fmt.Println("│  Admin password : password                         │")
-		fmt.Println("│                                                    │")
-		fmt.Println("│  Default vault  : public (no API key required)     │")
-		fmt.Println("│                                                    │")
-		fmt.Println("│  Change your password and review vault settings    │")
-		fmt.Println("│  in the admin UI before exposing to a network.     │")
-		fmt.Println("└──────────────────────────────────────────────────┘")
+		if envPassword != "" {
+			fmt.Println("┌──────────────────────────────────────────────────┐")
+			fmt.Println("│            MuninnDB — First Run Setup             │")
+			fmt.Println("│                                                    │")
+			fmt.Println("│  Admin username : root                             │")
+			fmt.Println("│  Admin password : (set via MUNINN_ADMIN_PASSWORD)  │")
+			fmt.Println("│                                                    │")
+			fmt.Println("│  Default vault  : public (no API key required)     │")
+			fmt.Println("└──────────────────────────────────────────────────┘")
+		} else {
+			fmt.Println("┌──────────────────────────────────────────────────┐")
+			fmt.Println("│            MuninnDB — First Run Setup             │")
+			fmt.Println("│                                                    │")
+			fmt.Println("│  Admin username : root                             │")
+			fmt.Println("│  Admin password : password                         │")
+			fmt.Println("│                                                    │")
+			fmt.Println("│  Default vault  : public (no API key required)     │")
+			fmt.Println("│                                                    │")
+			fmt.Println("│  Change your password and review vault settings    │")
+			fmt.Println("│  in the admin UI before exposing to a network.     │")
+			fmt.Println("└──────────────────────────────────────────────────┘")
+		}
+	} else if envPassword != "" {
+		// Existing instance: MUNINN_ADMIN_PASSWORD is set — update the root password
+		// so operators can rotate credentials via environment variable.
+		if changeErr := store.ChangeAdminPassword("root", envPassword); changeErr != nil {
+			slog.Warn("failed to apply MUNINN_ADMIN_PASSWORD to existing root account",
+				"err", changeErr)
+		} else {
+			slog.Info("root admin password updated from MUNINN_ADMIN_PASSWORD")
+		}
 	}
 
 	// Ensure at least one vault config exists. Covers both fresh installs

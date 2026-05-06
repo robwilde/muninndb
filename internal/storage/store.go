@@ -85,6 +85,12 @@ type EngineStore interface {
 	// weight-sorted descending, up to maxPerNode per source.
 	GetAssociations(ctx context.Context, wsPrefix [8]byte, ids []ULID, maxPerNode int) (map[ULID][]Association, error)
 
+	// GetReverseAssociations returns all associations that TARGET the given id,
+	// by scanning the 0x04 reverse index. The returned Association.TargetID
+	// is the SOURCE engram (the engram that points TO id). Results are capped
+	// at maxPerNode entries.
+	GetReverseAssociations(ctx context.Context, wsPrefix [8]byte, id ULID, maxPerNode int) ([]Association, error)
+
 	// RecentActive returns up to topK engram IDs with the highest relevance
 	// in the vault. Uses the 0x10 relevance bucket index for O(k) scanning.
 	RecentActive(ctx context.Context, wsPrefix [8]byte, topK int) ([]ULID, error)
@@ -132,6 +138,11 @@ type EngineStore interface {
 	// using the 0x0B state secondary index.
 	ListByState(ctx context.Context, wsPrefix [8]byte, state LifecycleState, limit int) ([]ULID, error)
 
+	// ListByStateFrom is the cursor-based variant of ListByState.
+	// afterID is the exclusive starting cursor — pass a zero ULID to start from the beginning.
+	// Returns at most limit IDs strictly after afterID in index order.
+	ListByStateFrom(ctx context.Context, wsPrefix [8]byte, state LifecycleState, afterID ULID, limit int) ([]ULID, error)
+
 	// VaultPrefix computes the 8-byte SipHash prefix for a vault name.
 	VaultPrefix(vault string) [8]byte
 
@@ -152,6 +163,12 @@ type EngineStore interface {
 	// EngramsByCreatedSince returns engrams created at or after since, ordered
 	// by creation time (ascending), with offset/limit for pagination.
 	EngramsByCreatedSince(ctx context.Context, wsPrefix [8]byte, since time.Time, offset, limit int) ([]*Engram, error)
+
+	// CountEngramsByDay returns the number of engrams created on each day
+	// between since and until (inclusive). The returned map keys are dates in
+	// "YYYY-MM-DD" format (UTC). Scans only 0x01 key headers without
+	// deserializing values, so it is efficient for large ranges.
+	CountEngramsByDay(ctx context.Context, wsPrefix [8]byte, since, until time.Time) (map[string]int64, error)
 
 	// WriteOrdinal atomically writes the ordinal for childID within parentID.
 	// Overwrites any existing value.
@@ -182,6 +199,12 @@ type EngineStore interface {
 	// WriteEntityEngramLink writes a vault-scoped engram→entity link.
 	WriteEntityEngramLink(ctx context.Context, ws [8]byte, engramID ULID, entityName string) error
 
+	// RelinkEntityEngramLink atomically moves a vault-scoped engram link from fromEntity
+	// to toEntity in a single Pebble batch, writing the new 0x20/0x23 keys for toEntity
+	// and deleting the stale 0x20/0x23 keys for fromEntity. Eliminates the crash window
+	// that exists when WriteEntityEngramLink and DeleteEntityEngramLink are called separately.
+	RelinkEntityEngramLink(ctx context.Context, ws [8]byte, engramID ULID, fromEntity, toEntity string) error
+
 	// ScanEntityEngrams scans the 0x23 reverse index for all vault-scoped (ws, engramID)
 	// pairs that mention the given entity name. Calls fn for each pair until fn returns
 	// a non-nil error or the index is exhausted.
@@ -198,9 +221,30 @@ type EngineStore interface {
 	// UpsertRelationshipRecord writes a vault-scoped relationship record.
 	UpsertRelationshipRecord(ctx context.Context, ws [8]byte, engramID ULID, record RelationshipRecord) error
 
+	// ScanEngramRelationships scans the 0x21 prefix for all entity relationship records
+	// sourced from a specific engram. More efficient than ScanRelationships for single-engram
+	// lookups because it uses the per-engram prefix (0x21|ws|engramID) rather than a full vault scan.
+	ScanEngramRelationships(ctx context.Context, ws [8]byte, engramID ULID, fn func(record RelationshipRecord) error) error
+
 	// ScanRelationships scans all vault-scoped relationship records at the 0x21 prefix.
 	// Calls fn for each RelationshipRecord until fn returns a non-nil error or the scan is exhausted.
+	// Use ScanEntityRelationships for per-entity queries — this method does a full vault scan.
 	ScanRelationships(ctx context.Context, ws [8]byte, fn func(record RelationshipRecord) error) error
+
+	// ScanEntityRelationships returns all relationship records where entityName appears
+	// as fromEntity or toEntity, using the 0x26 relationship entity index.
+	// O(engrams-referencing-entity) instead of O(all vault relationships).
+	ScanEntityRelationships(ctx context.Context, ws [8]byte, entityName string, fn func(record RelationshipRecord) error) error
+
+	// DeleteEntityEngramLink deletes the 0x20 forward key and 0x23 reverse key for a
+	// specific (engram, entity) pair atomically. Used by MergeEntity to clean up stale links.
+	DeleteEntityEngramLink(ctx context.Context, ws [8]byte, engramID ULID, entityName string) error
+
+	// RelinkRelationshipEntity updates all 0x21 relationship records in vault ws where
+	// oldName appears as fromEntity or toEntity, replacing it with newName and updating
+	// both the 0x21 key (which encodes the entity hash) and the 0x26 index accordingly.
+	// Called by MergeEntity after relinking engram-entity links.
+	RelinkRelationshipEntity(ctx context.Context, ws [8]byte, oldName, newName string) error
 
 	// IncrementEntityCoOccurrence increments the co-occurrence count for two entity names
 	// within a vault. Uses the 0x24 index. Pair is stored in canonical (hashA <= hashB) order.

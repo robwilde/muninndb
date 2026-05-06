@@ -117,6 +117,22 @@ var subcommandHelp = map[string]func(){
 				"muninn logs 50 --level warn --no-follow",
 			})
 	},
+	"exec": func() {
+		printExecHelp()
+	},
+	"dream": func() {
+		printSubcommandUsage("dream", "LLM-driven memory consolidation", "muninn dream [flags]",
+			[][2]string{
+				{"--force", "Bypass trigger gates (not yet implemented)"},
+				{"--dry-run", "Preview changes without writing"},
+				{"--scope <vault>", "Limit to a single vault"},
+				{"--data-dir <dir>", "Data directory (default: ~/.muninn/data)"},
+			},
+			[]string{
+				"muninn dream --dry-run",
+				"muninn dream --force --scope work",
+			})
+	},
 	"backup": func() {
 		printSubcommandUsage("backup", "offline point-in-time backup", "muninn backup --output <dir> [flags]",
 			[][2]string{
@@ -225,6 +241,7 @@ var subcommandHelp = map[string]func(){
 				"muninn admin change-password -u root -p",
 			})
 	},
+	"audit": printAuditUsage,
 	"mcp": func() {
 		printSubcommandUsage("mcp", "stdio→HTTP MCP proxy for OpenClaw", "muninn mcp",
 			[][2]string{
@@ -301,6 +318,8 @@ func printHelp() {
 	fmt.Printf("  %-32s %s\n", cyan("muninn vault <command>"), "Vault management (create, list, delete, clear, clone, merge, export, import)")
 	fmt.Printf("  %-32s %s\n", cyan("muninn api-key <command>"), "API key management (create, list, revoke)")
 	fmt.Printf("  %-32s %s\n", cyan("muninn admin change-password"), "Change the admin password")
+	fmt.Printf("  %-32s %s\n", cyan("muninn exec <op> [flags]"), "One-shot remember/recall/read/forget (no daemon needed)")
+	fmt.Printf("  %-32s %s\n", cyan("muninn dream [--dry-run]"), "LLM-driven memory consolidation (server must be stopped)")
 	fmt.Printf("  %-32s %s\n", cyan("muninn backup --output <dir>"), "Offline point-in-time backup (server must be stopped)")
 	fmt.Printf("  %-32s %s\n", cyan("muninn cluster"), "Cluster management (info, status, failover, add-node, remove-node)")
 	fmt.Printf("  %-32s %s\n", cyan("muninn mcp"), "stdio→HTTP MCP proxy (for OpenClaw)")

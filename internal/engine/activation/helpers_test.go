@@ -2,6 +2,7 @@ package activation
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -328,7 +329,7 @@ func TestComputeComponents_CachedLastAccess(t *testing.T) {
 func TestBuildWhy_SemanticDominant(t *testing.T) {
 	eng := &storage.Engram{Relevance: 0.5}
 	c := ScoreComponents{SemanticSimilarity: 0.9, FullTextRelevance: 0.1, DecayFactor: 0.1, Confidence: 0.8}
-	why := buildWhy(eng, c, nil, nil, "test query")
+	why := buildWhy(eng, c, nil, nil, "test query", true)
 	if why == "" {
 		t.Error("expected non-empty why string")
 	}
@@ -337,7 +338,7 @@ func TestBuildWhy_SemanticDominant(t *testing.T) {
 func TestBuildWhy_FTSDominant(t *testing.T) {
 	eng := &storage.Engram{Relevance: 0.5}
 	c := ScoreComponents{SemanticSimilarity: 0.1, FullTextRelevance: 0.9, DecayFactor: 0.1, Confidence: 0.8}
-	why := buildWhy(eng, c, nil, nil, "test query that is very long and exceeds forty characters for truncation testing")
+	why := buildWhy(eng, c, nil, nil, "test query that is very long and exceeds forty characters for truncation testing", true)
 	if why == "" {
 		t.Error("expected non-empty why string")
 	}
@@ -348,7 +349,7 @@ func TestBuildWhy_WithHopPath(t *testing.T) {
 	c := ScoreComponents{HebbianBoost: 0.9, Confidence: 0.8}
 	path := []storage.ULID{{1}, {2}, {3}}
 	concepts := []string{"alpha", "beta", "gamma"}
-	why := buildWhy(eng, c, path, concepts, "")
+	why := buildWhy(eng, c, path, concepts, "", true)
 	if why == "" {
 		t.Error("expected non-empty why string with hops")
 	}
@@ -357,18 +358,24 @@ func TestBuildWhy_WithHopPath(t *testing.T) {
 func TestBuildWhy_LowConfidence(t *testing.T) {
 	eng := &storage.Engram{Relevance: 0.5}
 	c := ScoreComponents{SemanticSimilarity: 0.8, Confidence: 0.3}
-	why := buildWhy(eng, c, nil, nil, "test")
+	why := buildWhy(eng, c, nil, nil, "test", true)
 	if why == "" {
 		t.Error("expected non-empty why string")
 	}
 }
 
-func TestBuildWhy_DormantEngram(t *testing.T) {
+func TestBuildWhy_DormantEngram_LegacyMode(t *testing.T) {
 	eng := &storage.Engram{Relevance: minFloor * 1.05}
 	c := ScoreComponents{DecayFactor: 0.9, Confidence: 0.8}
-	why := buildWhy(eng, c, nil, nil, "")
-	if why == "" {
-		t.Error("expected non-empty why string for dormant engram")
+	// Legacy mode: dormant annotation should appear.
+	why := buildWhy(eng, c, nil, nil, "", false)
+	if !strings.Contains(why, "dormant") {
+		t.Error("legacy mode: expected dormant annotation for low-relevance engram")
+	}
+	// ACT-R mode: dormant annotation should NOT appear.
+	why2 := buildWhy(eng, c, nil, nil, "", true)
+	if strings.Contains(why2, "dormant") {
+		t.Error("ACT-R mode: dormant annotation should not appear")
 	}
 }
 
@@ -376,7 +383,7 @@ func TestBuildWhy_HopPathWithoutConcepts(t *testing.T) {
 	eng := &storage.Engram{Relevance: 0.5}
 	c := ScoreComponents{HebbianBoost: 0.9, Confidence: 0.8}
 	path := []storage.ULID{{1}, {2}}
-	why := buildWhy(eng, c, path, nil, "")
+	why := buildWhy(eng, c, path, nil, "", true)
 	if why == "" {
 		t.Error("expected non-empty why string")
 	}
@@ -1345,6 +1352,249 @@ func TestPhase6Score_WithTraversedCandidates(t *testing.T) {
 	}
 }
 
+// TestPhase6Score_TraversedCandidateACTR_NonZeroScore verifies the fix for issue #371:
+// BFS-traversed candidates must receive a non-zero ACT-R score when both the query and
+// engram have embeddings. Before the fix, vectorScore was 0 for all traversed candidates,
+// making contentMatch=0 and therefore ACT-R raw=0 regardless of the BFS propagated score.
+func TestPhase6Score_TraversedCandidateACTR_NonZeroScore(t *testing.T) {
+	store := newInternalStubStore()
+	e := newTestActivationEngine(store)
+	defer e.Close()
+
+	// Seed engram: directly matched by query (in fused set).
+	eng1 := &storage.Engram{
+		Concept: "microservices", Content: "Project Alpha uses microservices",
+		Confidence: 1.0, Stability: 30.0, State: storage.StateActive,
+		Embedding: []float32{1, 0, 0},
+	}
+	// Traversed engram: discovered via BFS from eng1, not directly matched but related.
+	// Embedding is non-orthogonal to the query so cosine similarity > 0.
+	eng2 := &storage.Engram{
+		Concept: "scaling issues", Content: "Microservices cause scaling issues in our infrastructure",
+		Confidence: 1.0, Stability: 30.0, State: storage.StateActive,
+		Embedding: []float32{0.6, 0.8, 0},
+	}
+	store.addEngram(eng1)
+	store.addEngram(eng2)
+
+	fused := []fusedCandidate{{id: eng1.ID, rrfScore: 0.5, vectorScore: 1.0, ftsScore: 1.5}}
+	traversed := []traversedCandidate{{
+		id:         eng2.ID,
+		propagated: 0.3,
+		hopPath:    []storage.ULID{eng1.ID, eng2.ID},
+		relType:    uint16(storage.RelSupports),
+	}}
+	// Query embedding points in the same general direction as eng2 (non-zero cosine similarity).
+	p1 := &phase1Result{
+		queryStr:  "risks for Project Alpha",
+		embedding: []float32{1, 0, 0},
+	}
+
+	result, err := e.phase6Score(context.Background(), &ActivateRequest{
+		MaxResults: 10,
+		Threshold:  0.01, // non-zero: proves score > 0, not just "engram passed nil-check"
+	}, [8]byte{}, fused, traversed, p1)
+	if err != nil {
+		t.Fatalf("phase6Score: %v", err)
+	}
+
+	var traversedScore float64
+	for _, a := range result.Activations {
+		if a.Engram.ID == eng2.ID {
+			traversedScore = a.Score
+		}
+	}
+	if traversedScore <= 0 {
+		t.Errorf("traversed candidate score should be > 0 with embeddings and propagated=0.3, got %f", traversedScore)
+	}
+	// Verify vectorScore was computed and wired into components.
+	for _, a := range result.Activations {
+		if a.Engram.ID == eng2.ID {
+			if a.Components.SemanticSimilarity <= 0 {
+				t.Errorf("traversed candidate SemanticSimilarity should be > 0, got %f", a.Components.SemanticSimilarity)
+			}
+			if a.Components.HebbianBoost <= 0 {
+				t.Errorf("traversed candidate HebbianBoost should be > 0 (from BFS propagated score), got %f", a.Components.HebbianBoost)
+			}
+		}
+	}
+}
+
+// TestPhase6Score_TraversedCandidateACTR_NoEmbedding verifies backward compatibility:
+// traversed candidates without embeddings (or without a query embedding) still pass
+// through at threshold=0.0, preserving existing behaviour for deployments without HNSW.
+func TestPhase6Score_TraversedCandidateACTR_NoEmbedding(t *testing.T) {
+	store := newInternalStubStore()
+	e := newTestActivationEngine(store)
+	defer e.Close()
+
+	eng1 := &storage.Engram{
+		Concept: "seed", Content: "seed content",
+		Confidence: 1.0, Stability: 30.0, State: storage.StateActive,
+	}
+	eng2 := &storage.Engram{
+		Concept: "discovered", Content: "discovered via BFS — no embedding",
+		Confidence: 1.0, Stability: 30.0, State: storage.StateActive,
+		// no Embedding field — vectorScore will remain 0
+	}
+	store.addEngram(eng1)
+	store.addEngram(eng2)
+
+	fused := []fusedCandidate{{id: eng1.ID, rrfScore: 0.5, ftsScore: 1.0}}
+	traversed := []traversedCandidate{{
+		id:         eng2.ID,
+		propagated: 0.3,
+		hopPath:    []storage.ULID{eng1.ID, eng2.ID},
+		relType:    uint16(storage.RelSupports),
+	}}
+	p1 := &phase1Result{queryStr: "test"} // no query embedding
+
+	result, err := e.phase6Score(context.Background(), &ActivateRequest{
+		MaxResults: 10,
+		Threshold:  0.0,
+	}, [8]byte{}, fused, traversed, p1)
+	if err != nil {
+		t.Fatalf("phase6Score: %v", err)
+	}
+
+	found := false
+	for _, a := range result.Activations {
+		if a.Engram.ID == eng2.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("traversed candidate should appear at threshold=0.0 even without embeddings")
+	}
+}
+
+// TestPhase6Score_TraversedCandidateRRF_NonZeroScore is a regression test for a bug
+// introduced in the original #392 fix: setting hebbianBoost but leaving rrfScore=0 caused
+// traversed candidates to score 0 in RRF mode (final = rrfScore × (1+hebbianBoost) = 0),
+// silently filtering them out at any threshold > 0. The fix sets rrfScore = t.propagated
+// alongside hebbianBoost so RRF mode still scores traversed candidates.
+func TestPhase6Score_TraversedCandidateRRF_NonZeroScore(t *testing.T) {
+	store := newInternalStubStore()
+	e := newTestActivationEngine(store)
+	defer e.Close()
+
+	eng1 := &storage.Engram{
+		Concept: "seed", Content: "seed content",
+		Confidence: 1.0, Stability: 30.0, State: storage.StateActive,
+	}
+	eng2 := &storage.Engram{
+		Concept: "discovered", Content: "discovered via BFS",
+		Confidence: 1.0, Stability: 30.0, State: storage.StateActive,
+	}
+	store.addEngram(eng1)
+	store.addEngram(eng2)
+
+	fused := []fusedCandidate{{id: eng1.ID, rrfScore: 0.5, ftsScore: 1.0}}
+	traversed := []traversedCandidate{{
+		id:         eng2.ID,
+		propagated: 0.3,
+		hopPath:    []storage.ULID{eng1.ID, eng2.ID},
+		relType:    uint16(storage.RelSupports),
+	}}
+	p1 := &phase1Result{queryStr: "test"}
+
+	result, err := e.phase6Score(context.Background(), &ActivateRequest{
+		MaxResults: 10,
+		Threshold:  0.01, // above zero: filtered if rrfScore is 0
+		Weights:    &Weights{UseRRFFusion: true},
+	}, [8]byte{}, fused, traversed, p1)
+	if err != nil {
+		t.Fatalf("phase6Score: %v", err)
+	}
+
+	var traversedScore float64
+	found := false
+	for _, a := range result.Activations {
+		if a.Engram.ID == eng2.ID {
+			found = true
+			traversedScore = a.Score
+		}
+	}
+	if !found {
+		t.Error("traversed candidate should appear in RRF mode results at threshold=0.01")
+	}
+	if traversedScore <= 0 {
+		t.Errorf("traversed candidate score should be > 0 in RRF mode with propagated=0.3, got %f", traversedScore)
+	}
+}
+
+// TestCosineSimilarity32 verifies the cosineSimilarity32 helper used in the BFS fix.
+func TestCosineSimilarity32(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b []float32
+		want float32
+		tol  float32
+	}{
+		{
+			name: "identical unit vectors",
+			a:    []float32{1, 0, 0},
+			b:    []float32{1, 0, 0},
+			want: 1.0,
+			tol:  1e-6,
+		},
+		{
+			name: "orthogonal vectors",
+			a:    []float32{1, 0, 0},
+			b:    []float32{0, 1, 0},
+			want: 0.0,
+			tol:  1e-6,
+		},
+		{
+			name: "opposite vectors",
+			a:    []float32{1, 0, 0},
+			b:    []float32{-1, 0, 0},
+			want: -1.0,
+			tol:  1e-6,
+		},
+		{
+			name: "45-degree angle",
+			a:    []float32{1, 0},
+			b:    []float32{1, 1},
+			want: float32(1.0 / 1.4142135), // 1/√2 ≈ 0.7071
+			tol:  1e-5,
+		},
+		{
+			name: "empty vectors",
+			a:    []float32{},
+			b:    []float32{},
+			want: 0.0,
+			tol:  0,
+		},
+		{
+			name: "mismatched lengths",
+			a:    []float32{1, 2},
+			b:    []float32{1},
+			want: 0.0,
+			tol:  0,
+		},
+		{
+			name: "zero vector",
+			a:    []float32{0, 0, 0},
+			b:    []float32{1, 0, 0},
+			want: 0.0,
+			tol:  0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := cosineSimilarity32(tc.a, tc.b)
+			diff := got - tc.want
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff > tc.tol {
+				t.Errorf("cosineSimilarity32(%v, %v) = %f, want %f (tol %f)", tc.a, tc.b, got, tc.want, tc.tol)
+			}
+		})
+	}
+}
+
 func TestPhase6Score_IncludeWhy(t *testing.T) {
 	store := newInternalStubStore()
 	e := newTestActivationEngine(store)
@@ -1451,6 +1701,7 @@ func TestPhase6Score_DormantFlag(t *testing.T) {
 	fused := []fusedCandidate{{id: eng1.ID, rrfScore: 0.5, ftsScore: 1.0}}
 	p1 := &phase1Result{queryStr: "test"}
 
+	// Default mode is ACT-R — Dormant should be false (dormancy is implicit).
 	result, err := e.phase6Score(context.Background(), &ActivateRequest{
 		MaxResults: 10, Threshold: 0.0,
 	}, [8]byte{}, fused, nil, p1)
@@ -1459,8 +1710,27 @@ func TestPhase6Score_DormantFlag(t *testing.T) {
 		t.Fatalf("phase6Score: %v", err)
 	}
 	for _, a := range result.Activations {
+		if a.Engram.ID == eng1.ID && a.Dormant {
+			t.Error("ACT-R mode: engram should not be marked Dormant (dormancy is implicit via scoring)")
+		}
+	}
+
+	// Legacy mode (DisableACTR) — Dormant should reflect Relevance.
+	result2, err := e.phase6Score(context.Background(), &ActivateRequest{
+		MaxResults: 10, Threshold: 0.0,
+		Weights: &Weights{
+			DisableACTR:        true,
+			SemanticSimilarity: 0.35,
+			FullTextRelevance:  0.25,
+			DecayFactor:        0.20,
+		},
+	}, [8]byte{}, fused, nil, p1)
+	if err != nil {
+		t.Fatalf("phase6Score legacy: %v", err)
+	}
+	for _, a := range result2.Activations {
 		if a.Engram.ID == eng1.ID && !a.Dormant {
-			t.Error("engram with low Relevance should have Dormant=true")
+			t.Error("legacy mode: engram with Relevance=0.01 should have Dormant=true")
 		}
 	}
 }

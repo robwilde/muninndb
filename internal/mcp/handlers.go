@@ -3,8 +3,10 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -15,6 +17,32 @@ import (
 	"github.com/scrypster/muninndb/internal/transport/mbp"
 	"golang.org/x/text/unicode/norm"
 )
+
+// annotationStaleDays is the threshold for marking a recalled memory as stale.
+// Memories not accessed in more than this many days are flagged stale=true.
+const annotationStaleDays = 30.0
+
+// parseEmbedding extracts and validates an optional "embedding" field from args.
+// Returns (nil, "") when the field is absent. Returns (nil, errMsg) on validation
+// failure. The caller is responsible for the vault dimension check when needed.
+func parseEmbeddingArg(args map[string]any) ([]float32, string) {
+	embAny, ok := args["embedding"].([]any)
+	if !ok || len(embAny) == 0 {
+		return nil, ""
+	}
+	if len(embAny) > 4096 {
+		return nil, "invalid params: 'embedding' exceeds maximum length of 4096"
+	}
+	embedding := make([]float32, len(embAny))
+	for i, v := range embAny {
+		f, ok := v.(float64)
+		if !ok {
+			return nil, fmt.Sprintf("invalid params: embedding[%d] must be a number", i)
+		}
+		embedding[i] = float32(f)
+	}
+	return embedding, ""
+}
 
 func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
 	opID, _ := args["op_id"].(string)
@@ -79,6 +107,16 @@ func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, i
 	}
 	applyTypeArgs(args, req)
 	malformed := applyEnrichmentArgs(args, req)
+	if emb, errMsg := parseEmbeddingArg(args); errMsg != "" {
+		sendError(w, id, -32602, errMsg)
+		return
+	} else if len(emb) > 0 {
+		if vaultDim := s.engine.GetVaultEmbedDim(ctx, vault); vaultDim > 0 && len(emb) != vaultDim {
+			sendError(w, id, -32602, fmt.Sprintf("invalid params: embedding dimension %d does not match vault dimension %d", len(emb), vaultDim))
+			return
+		}
+		req.Embedding = emb
+	}
 
 	resp, err := s.engine.Write(ctx, req)
 	if err != nil {
@@ -91,7 +129,9 @@ func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, i
 		}
 	}
 	result := WriteResult{ID: resp.ID, Concept: req.Concept}
-	if len(content) > 500 {
+	if resp.Hint != "" {
+		result.Hint = resp.Hint
+	} else if len(content) > 500 {
 		result.Hint = "Tip: memories work best when each one captures a single concept. For future writes, consider using muninn_remember_batch to store multiple focused memories at once."
 	}
 	if malformed > 0 {
@@ -162,6 +202,16 @@ func (s *MCPServer) handleRememberBatch(ctx context.Context, w http.ResponseWrit
 		}
 		applyTypeArgs(m, req)
 		malformed := applyEnrichmentArgs(m, req)
+		if emb, errMsg := parseEmbeddingArg(m); errMsg != "" {
+			sendError(w, id, -32602, fmt.Sprintf("invalid params: memories[%d].%s", i, strings.TrimPrefix(errMsg, "invalid params: ")))
+			return
+		} else if len(emb) > 0 {
+			if vaultDim := s.engine.GetVaultEmbedDim(ctx, vault); vaultDim > 0 && len(emb) != vaultDim {
+				sendError(w, id, -32602, fmt.Sprintf("invalid params: memories[%d].embedding dimension %d does not match vault dimension %d", i, len(emb), vaultDim))
+				return
+			}
+			req.Embedding = emb
+		}
 		reqs = append(reqs, req)
 		malformedCounts = append(malformedCounts, malformed)
 	}
@@ -312,6 +362,18 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 		}
 		req.Filters = append(req.Filters, mbp.Filter{Field: "created_before", Op: "<", Value: t})
 	}
+	if emb, errMsg := parseEmbeddingArg(args); errMsg != "" {
+		sendError(w, id, -32602, errMsg)
+		return
+	} else if len(emb) > 0 {
+		if vaultDim := s.engine.GetVaultEmbedDim(ctx, vault); vaultDim > 0 && len(emb) != vaultDim {
+			sendError(w, id, -32602, fmt.Sprintf("invalid params: embedding dimension %d does not match vault dimension %d", len(emb), vaultDim))
+			return
+		}
+		req.Embedding = emb
+	}
+
+	annotate, _ := args["annotate"].(bool)
 
 	resp, err := s.engine.Activate(ctx, req)
 	if err != nil {
@@ -323,10 +385,27 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 	for i := range resp.Activations {
 		memories = append(memories, activationToMemory(&resp.Activations[i]))
 	}
-	sendResult(w, id, textContent(mustJSON(map[string]any{
+
+	if annotate {
+		for i, item := range resp.Activations {
+			ann, err := s.engine.GetAnnotations(ctx, vault, item.ID)
+			if err != nil || ann == nil {
+				// Non-fatal: log and skip annotations for this result.
+				slog.Warn("handleRecall: GetAnnotations failed", "id", item.ID, "err", err)
+				continue
+			}
+			memories[i].Annotations = buildAnnotations(&item, ann)
+		}
+	}
+
+	result := map[string]any{
 		"memories": memories,
 		"total":    resp.TotalFound,
-	})))
+	}
+	if len(memories) == 0 {
+		result["hint"] = "No results matched. For session continuity try mode='recent', or use muninn_where_left_off. For semantic recall, provide more specific context."
+	}
+	sendResult(w, id, textContent(mustJSON(result)))
 }
 
 func (s *MCPServer) handleRead(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
@@ -430,7 +509,18 @@ func (s *MCPServer) handleEvolve(ctx context.Context, w http.ResponseWriter, id 
 		sendError(w, id, -32602, "invalid params: 'id', 'new_content', 'reason' are required")
 		return
 	}
-	result, err := s.engine.Evolve(ctx, vault, engramID, newContent, reason)
+	var evolveEmb []float32
+	if emb, errMsg := parseEmbeddingArg(args); errMsg != "" {
+		sendError(w, id, -32602, errMsg)
+		return
+	} else if len(emb) > 0 {
+		if vaultDim := s.engine.GetVaultEmbedDim(ctx, vault); vaultDim > 0 && len(emb) != vaultDim {
+			sendError(w, id, -32602, fmt.Sprintf("invalid params: embedding dimension %d does not match vault dimension %d", len(emb), vaultDim))
+			return
+		}
+		evolveEmb = emb
+	}
+	result, err := s.engine.Evolve(ctx, vault, engramID, newContent, reason, evolveEmb)
 	if err != nil {
 		sendError(w, id, -32000, "tool error: "+err.Error())
 		return
@@ -610,10 +700,18 @@ func (s *MCPServer) handleExplain(ctx context.Context, w http.ResponseWriter, id
 		sendError(w, id, -32602, "invalid params: 'query' is required and must be a non-empty array of strings")
 		return
 	}
-	result, err := s.engine.Explain(ctx, vault, &ExplainRequest{
-		EngramID: engramID,
-		Query:    query,
-	})
+	explainReq := &ExplainRequest{EngramID: engramID, Query: query}
+	if emb, errMsg := parseEmbeddingArg(args); errMsg != "" {
+		sendError(w, id, -32602, errMsg)
+		return
+	} else if len(emb) > 0 {
+		if vaultDim := s.engine.GetVaultEmbedDim(ctx, vault); vaultDim > 0 && len(emb) != vaultDim {
+			sendError(w, id, -32602, fmt.Sprintf("invalid params: embedding dimension %d does not match vault dimension %d", len(emb), vaultDim))
+			return
+		}
+		explainReq.Embedding = emb
+	}
+	result, err := s.engine.Explain(ctx, vault, explainReq)
 	if err != nil {
 		sendError(w, id, -32000, "tool error: "+err.Error())
 		return
@@ -889,17 +987,91 @@ func (s *MCPServer) handleEntityState(ctx context.Context, w http.ResponseWriter
 		sendError(w, id, -32602, "invalid params: 'merged_into' is required when state=merged")
 		return
 	}
+	entityType, _ := args["type"].(string)
 
-	if err := s.engine.SetEntityState(ctx, entityName, state, mergedInto); err != nil {
+	if err := s.engine.SetEntityState(ctx, entityName, state, mergedInto, entityType); err != nil {
 		sendError(w, id, -32000, "tool error: "+err.Error())
 		return
 	}
-	out, _ := json.Marshal(map[string]any{
+	resp := map[string]any{
 		"entity": entityName,
 		"state":  state,
 		"ok":     true,
-	})
+	}
+	if entityType != "" {
+		resp["type"] = entityType
+	}
+	out, _ := json.Marshal(resp)
 	sendResult(w, id, textContent(string(out)))
+}
+
+func (s *MCPServer) handleEntityStateBatch(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
+	opsAny, ok := args["operations"].([]any)
+	if !ok || len(opsAny) == 0 {
+		sendError(w, id, -32602, "invalid params: 'operations' is required and must be a non-empty array")
+		return
+	}
+	if len(opsAny) > 50 {
+		sendError(w, id, -32602, "invalid params: 'operations' exceeds maximum of 50")
+		return
+	}
+
+	validEntityStates := map[string]bool{
+		"active": true, "deprecated": true, "merged": true, "resolved": true,
+	}
+
+	ops := make([]engine.EntityStateOp, 0, len(opsAny))
+	for i, opAny := range opsAny {
+		op, ok := opAny.(map[string]any)
+		if !ok {
+			sendError(w, id, -32602, fmt.Sprintf("invalid params: operations[%d] must be an object", i))
+			return
+		}
+		entityName, ok := op["entity_name"].(string)
+		if !ok || entityName == "" {
+			sendError(w, id, -32602, fmt.Sprintf("invalid params: operations[%d].entity_name is required", i))
+			return
+		}
+		state, ok := op["state"].(string)
+		if !ok || !validEntityStates[state] {
+			sendError(w, id, -32602, fmt.Sprintf("invalid params: operations[%d].state must be one of: active, deprecated, merged, resolved", i))
+			return
+		}
+		mergedInto, _ := op["merged_into"].(string)
+		if state == "merged" && mergedInto == "" {
+			sendError(w, id, -32602, fmt.Sprintf("invalid params: operations[%d].merged_into is required when state=merged", i))
+			return
+		}
+		entityType, _ := op["type"].(string)
+		ops = append(ops, engine.EntityStateOp{
+			EntityName: entityName,
+			State:      state,
+			MergedInto: mergedInto,
+			EntityType: entityType,
+		})
+	}
+
+	errs := s.engine.SetEntityStateBatch(ctx, ops)
+
+	type batchItemResult struct {
+		Index  int    `json:"index"`
+		Entity string `json:"entity"`
+		State  string `json:"state,omitempty"`
+		Status string `json:"status"`
+		Error  string `json:"error,omitempty"`
+	}
+	results := make([]batchItemResult, len(ops))
+	for i, op := range ops {
+		if errs[i] != nil {
+			results[i] = batchItemResult{Index: i, Entity: op.EntityName, Status: "error", Error: errs[i].Error()}
+		} else {
+			results[i] = batchItemResult{Index: i, Entity: op.EntityName, State: op.State, Status: "ok"}
+		}
+	}
+	sendResult(w, id, textContent(mustJSON(map[string]any{
+		"results": results,
+		"total":   len(results),
+	})))
 }
 
 func (s *MCPServer) handleAddChild(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
@@ -932,6 +1104,16 @@ func (s *MCPServer) handleAddChild(ctx context.Context, w http.ResponseWriter, i
 	if ord, ok := args["ordinal"].(float64); ok {
 		o := int32(ord)
 		child.Ordinal = &o
+	}
+	if emb, errMsg := parseEmbeddingArg(args); errMsg != "" {
+		sendError(w, id, -32602, errMsg)
+		return
+	} else if len(emb) > 0 {
+		if vaultDim := s.engine.GetVaultEmbedDim(ctx, vault); vaultDim > 0 && len(emb) != vaultDim {
+			sendError(w, id, -32602, fmt.Sprintf("invalid params: embedding dimension %d does not match vault dimension %d", len(emb), vaultDim))
+			return
+		}
+		child.Embedding = emb
 	}
 	result, err := s.engine.AddChild(ctx, vault, parentID, child)
 	if err != nil {
@@ -1285,20 +1467,140 @@ func (s *MCPServer) handleProvenance(ctx context.Context, w http.ResponseWriter,
 	sendResult(w, id, textContent(mustJSON(&ProvenanceResult{ID: engramID, Entries: entries})))
 }
 
+func (s *MCPServer) handleGetEnrichmentCandidates(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
+	if vault == "" {
+		sendError(w, id, -32602, "invalid params: 'vault' is required")
+		return
+	}
+	stages, errMsg := parseStageArgs(args)
+	if errMsg != "" {
+		sendError(w, id, -32602, errMsg)
+		return
+	}
+	limit := 50
+	if v, ok := args["limit"].(float64); ok {
+		if v < 0 {
+			v = 0
+		}
+		limit = int(v)
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	cursor, _ := args["cursor"].(string) // optional; "" means start from beginning
+	if cursor != "" {
+		if _, err := storage.ParseULID(cursor); err != nil {
+			sendError(w, id, -32602, "invalid params: cursor is not a valid ULID")
+			return
+		}
+	}
+	result, err := s.engine.GetEnrichmentCandidates(ctx, vault, stages, cursor, limit)
+	if err != nil {
+		sendError(w, id, -32000, "tool error: "+err.Error())
+		return
+	}
+	sendResult(w, id, textContent(mustJSON(result)))
+}
+
+func (s *MCPServer) handleApplyEnrichment(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
+	if vault == "" {
+		sendError(w, id, -32602, "invalid params: 'vault' is required")
+		return
+	}
+	engramID, ok := args["id"].(string)
+	if !ok || engramID == "" {
+		sendError(w, id, -32602, "invalid params: 'id' is required")
+		return
+	}
+	expectedUpdatedAt, ok := args["expected_updated_at"].(string)
+	if !ok || expectedUpdatedAt == "" {
+		sendError(w, id, -32602, "invalid params: 'expected_updated_at' is required")
+		return
+	}
+	stages, errMsg := parseStageArgsFromKey(args, "stages_completed")
+	if errMsg != "" {
+		sendError(w, id, -32602, errMsg)
+		return
+	}
+
+	req := &ApplyEnrichmentRequest{
+		ID:                engramID,
+		ExpectedUpdatedAt: expectedUpdatedAt,
+		Summary:           stringArg(args, "summary"),
+		MemoryType:        stringArg(args, "memory_type"),
+		TypeLabel:         stringArg(args, "type_label"),
+		StagesCompleted:   stages,
+		Source:            stringArg(args, "source"),
+	}
+	if entitiesAny, ok := args["entities"].([]any); ok {
+		req.Entities = make([]ApplyEnrichmentEntity, 0, len(entitiesAny))
+		for i, raw := range entitiesAny {
+			m, ok := raw.(map[string]any)
+			if !ok {
+				sendError(w, id, -32602, fmt.Sprintf("invalid params: entities[%d] must be an object", i))
+				return
+			}
+			name, _ := m["name"].(string)
+			etype, _ := m["type"].(string)
+			if name == "" || etype == "" {
+				sendError(w, id, -32602, fmt.Sprintf("invalid params: entities[%d] requires non-empty 'name' and 'type'", i))
+				return
+			}
+			entity := ApplyEnrichmentEntity{Name: name, Type: etype}
+			if v, ok := m["confidence"].(float64); ok {
+				entity.Confidence = float32(v)
+			}
+			req.Entities = append(req.Entities, entity)
+		}
+	}
+	if relsAny, ok := args["relationships"].([]any); ok {
+		req.Relationships = make([]ApplyEnrichmentRelationship, 0, len(relsAny))
+		for i, raw := range relsAny {
+			m, ok := raw.(map[string]any)
+			if !ok {
+				sendError(w, id, -32602, fmt.Sprintf("invalid params: relationships[%d] must be an object", i))
+				return
+			}
+			fromEntity, _ := m["from_entity"].(string)
+			toEntity, _ := m["to_entity"].(string)
+			relType, _ := m["rel_type"].(string)
+			if fromEntity == "" || toEntity == "" || relType == "" {
+				sendError(w, id, -32602, fmt.Sprintf("invalid params: relationships[%d] requires non-empty 'from_entity', 'to_entity', and 'rel_type'", i))
+				return
+			}
+			rel := ApplyEnrichmentRelationship{FromEntity: fromEntity, ToEntity: toEntity, RelType: relType}
+			if v, ok := m["weight"].(float64); ok {
+				rel.Weight = float32(v)
+			}
+			req.Relationships = append(req.Relationships, rel)
+		}
+	}
+
+	result, err := s.engine.ApplyEnrichment(ctx, vault, req)
+	if err != nil {
+		if errors.Is(err, engine.ErrEnrichmentConflict) {
+			sendError(w, id, -32009, "tool conflict: "+err.Error())
+			return
+		}
+		sendError(w, id, -32000, "tool error: "+err.Error())
+		return
+	}
+	sendResult(w, id, textContent(mustJSON(result)))
+}
+
 func (s *MCPServer) handleReplayEnrichment(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
 	if vault == "" {
 		sendError(w, id, -32602, "invalid params: 'vault' is required")
 		return
 	}
 
-	// Parse stages (optional array of strings).
-	var stages []string
-	if stagesAny, ok := args["stages"].([]any); ok {
-		for _, v := range stagesAny {
-			if s, ok := v.(string); ok && s != "" {
-				stages = append(stages, s)
-			}
-		}
+	stages, errMsg := parseStageArgs(args)
+	if errMsg != "" {
+		sendError(w, id, -32602, errMsg)
+		return
 	}
 
 	// Parse limit (optional, default 50, max 200).
@@ -1333,6 +1635,35 @@ func (s *MCPServer) handleReplayEnrichment(ctx context.Context, w http.ResponseW
 		"stages_run": result.StagesRun,
 		"dry_run":    result.DryRun,
 	})))
+}
+
+func parseStageArgs(args map[string]any) ([]string, string) {
+	return parseStageArgsFromKey(args, "stages")
+}
+
+func parseStageArgsFromKey(args map[string]any, key string) ([]string, string) {
+	rawStages, ok := args[key]
+	if !ok {
+		return nil, ""
+	}
+	stagesAny, ok := rawStages.([]any)
+	if !ok {
+		return nil, fmt.Sprintf("invalid params: '%s' must be an array of strings", key)
+	}
+	stages := make([]string, 0, len(stagesAny))
+	for i, v := range stagesAny {
+		s, ok := v.(string)
+		if !ok || s == "" {
+			return nil, fmt.Sprintf("invalid params: %s[%d] must be a non-empty string", key, i)
+		}
+		stages = append(stages, s)
+	}
+	return stages, ""
+}
+
+func stringArg(args map[string]any, key string) string {
+	v, _ := args[key].(string)
+	return v
 }
 
 func (s *MCPServer) handleFeedback(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
@@ -1407,4 +1738,47 @@ func (s *MCPServer) handleEntityTimeline(ctx context.Context, w http.ResponseWri
 		return
 	}
 	sendResult(w, id, textContent(mustJSON(timeline)))
+}
+
+// buildAnnotations constructs a MemoryAnnotations from engine annotation data
+// and the activation item. Staleness is derived from item.LastAccess (nanoseconds
+// Unix timestamp).
+func buildAnnotations(item *mbp.ActivationItem, data *engine.AnnotationData) *MemoryAnnotations {
+	staleDays := math.Round(time.Since(time.Unix(0, item.LastAccess)).Hours()/24.0*10) / 10
+	ann := &MemoryAnnotations{
+		Stale:         staleDays > annotationStaleDays,
+		StaleDays:     staleDays,
+		ConflictsWith: data.ConflictsWith,
+		SupersededBy:  data.SupersededBy,
+	}
+	if data.LastVerified != nil {
+		ann.LastVerified = data.LastVerified.UTC().Format(time.RFC3339)
+	}
+	return ann
+}
+
+func (s *MCPServer) handleSetTrust(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
+	engramID, ok := args["id"].(string)
+	if !ok || engramID == "" {
+		sendError(w, id, -32602, "invalid params: 'id' is required")
+		return
+	}
+	trustStr, ok := args["trust"].(string)
+	if !ok || trustStr == "" {
+		sendError(w, id, -32602, "invalid params: 'trust' is required (one of: verified, inferred, external, untrusted)")
+		return
+	}
+	if _, err := storage.ParseTrustLevel(trustStr); err != nil {
+		sendError(w, id, -32602, "invalid params: "+err.Error())
+		return
+	}
+	if err := s.engine.SetTrust(ctx, vault, engramID, trustStr); err != nil {
+		sendError(w, id, -32000, "tool error: "+err.Error())
+		return
+	}
+	sendResult(w, id, textContent(mustJSON(map[string]any{
+		"id":    engramID,
+		"trust": trustStr,
+		"ok":    true,
+	})))
 }

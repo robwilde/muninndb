@@ -5,6 +5,9 @@ on:
     branches: [develop]
   release:
     types: [published]
+  # workflow_dispatch allows manually triggering a Docker build (e.g. to
+  # republish after this workflow was updated). Select the ref in the GitHub UI.
+  workflow_dispatch:
 
 permissions:
   contents: read

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -368,18 +370,58 @@ func (c *ClusterCoordinator) runAsCortex(ctx context.Context) error {
 		return ctx.Err()
 	}
 
-	if currentEpoch == 0 {
-		slog.Info("cluster: epoch 0, bootstrapping election", "node", c.cfg.NodeID)
-		if err := c.election.StartElection(ctx); err != nil {
-			return fmt.Errorf("cluster: bootstrap election failed: %w", err)
-		}
+	// Always start an election on normal startup (epoch 0 = first boot,
+	// epoch > 0 = restart after clean shutdown or crash before handoff).
+	// The crash-mid-handoff recovery path above handles the only case where we
+	// promote without a new election.
+	slog.Info("cluster: starting election", "node", c.cfg.NodeID, "epoch", currentEpoch)
+	if err := c.election.StartElection(ctx); err != nil {
+		return fmt.Errorf("cluster: election failed: %w", err)
 	}
 
 	<-ctx.Done()
 	return ctx.Err()
 }
 
+// joinWithRetry attempts to join the Cortex, cycling through all seeds on each
+// attempt and retrying with equal-jitter exponential backoff until success or
+// ctx is canceled. Each attempt uses its own 30 s timeout so a canceled startup
+// context does not abort in-flight dials.
+func (c *ClusterCoordinator) joinWithRetry(ctx context.Context, seeds []string, role string) (JoinResult, error) {
+	const maxAttempts = 10
+	const joinTimeout = 30 * time.Second
+	const maxBackoff = 30 * time.Second
+
+	backoff := time.Second
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		cortexAddr := seeds[(attempt-1)%len(seeds)]
+		joinCtx, cancel := context.WithTimeout(context.Background(), joinTimeout)
+		resp, err := c.joinClient.Join(joinCtx, cortexAddr)
+		cancel()
+		if err == nil {
+			return resp, nil
+		}
+		slog.Warn("cluster: join attempt failed, will retry",
+			"role", role, "attempt", attempt, "max", maxAttempts,
+			"cortex", cortexAddr, "backoff", backoff, "err", err)
+		jitter := time.Duration(rand.Int63n(int64(backoff / 2)))
+		select {
+		case <-ctx.Done():
+			return JoinResult{}, ctx.Err()
+		case <-time.After(backoff/2 + jitter):
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+	return JoinResult{}, fmt.Errorf("failed to join cortex after %d attempts across %d seed(s)", maxAttempts, len(seeds))
+}
+
 // runAsLobe connects to seed, joins, then blocks while receiving replication.
+// Join attempts use a dedicated per-attempt context (not the parent) so a
+// canceled startup context does not kill in-flight dials. Retries use
+// exponential backoff capped at 30 s.
 func (c *ClusterCoordinator) runAsLobe(ctx context.Context) error {
 	c.roleMu.Lock()
 	c.role = RoleReplica
@@ -389,8 +431,7 @@ func (c *ClusterCoordinator) runAsLobe(ctx context.Context) error {
 		return errors.New("cluster: lobe requires at least one seed address")
 	}
 
-	cortexAddr := c.cfg.Seeds[0]
-	resp, err := c.joinClient.Join(ctx, cortexAddr)
+	resp, err := c.joinWithRetry(ctx, c.cfg.Seeds, "lobe")
 	if err != nil {
 		return fmt.Errorf("cluster: join failed: %w", err)
 	}
@@ -427,8 +468,7 @@ func (c *ClusterCoordinator) runAsObserver(ctx context.Context) error {
 		return errors.New("cluster: observer requires at least one seed address")
 	}
 
-	cortexAddr := c.cfg.Seeds[0]
-	resp, err := c.joinClient.Join(ctx, cortexAddr)
+	resp, err := c.joinWithRetry(ctx, c.cfg.Seeds, "observer")
 	if err != nil {
 		return fmt.Errorf("cluster: observer join failed: %w", err)
 	}
@@ -568,6 +608,46 @@ func (c *ClusterCoordinator) checkQuorumHealth() {
 	}
 }
 
+// HandleIncomingJoin processes a TypeJoinRequest frame on a raw inbound conn
+// whose node ID is not yet known. It registers the live conn under req.NodeID
+// so that peer.Send works immediately (no dial required), processes the join
+// request, and returns the joining node's stable ID so that handleClusterConn
+// can use it for all subsequent frames on the same connection.
+func (c *ClusterCoordinator) HandleIncomingJoin(conn net.Conn, payload []byte) (string, error) {
+	var req mbp.JoinRequest
+	if err := msgpack.Unmarshal(payload, &req); err != nil {
+		return "", fmt.Errorf("unmarshal JoinRequest: %w", err)
+	}
+
+	// Register the live inbound conn so peer.Send succeeds immediately.
+	// RegisterConn returns the PeerConn it created under the write lock,
+	// eliminating the TOCTOU gap of a separate GetPeer call.
+	peer := c.mgr.RegisterConn(req.NodeID, req.Addr, conn)
+
+	resp := c.joinHandler.HandleJoinRequest(req, peer)
+	respPayload, err := msgpack.Marshal(resp)
+	if err != nil {
+		return req.NodeID, fmt.Errorf("marshal JoinResponse: %w", err)
+	}
+	if err := peer.Send(mbp.TypeJoinResponse, respPayload); err != nil {
+		return req.NodeID, fmt.Errorf("cluster: send JoinResponse to %s: %w", req.NodeID, err)
+	}
+
+	if resp.NeedsSnapshot {
+		c.IncrementSnapshotCount()
+		go func() {
+			defer c.DecrementSnapshotCount()
+			ctx := context.Background()
+			if _, err := c.joinHandler.StreamSnapshot(ctx, peer); err != nil {
+				slog.Error("cluster: snapshot stream failed; closing connection so lobe can reconnect and retry",
+					"lobe", req.NodeID, "err", err)
+				_ = peer.Close()
+			}
+		}()
+	}
+	return req.NodeID, nil
+}
+
 // HandleIncomingFrame dispatches an incoming MBP frame from a peer to the right handler.
 // Called by the TCP listener when a frame arrives.
 func (c *ClusterCoordinator) HandleIncomingFrame(fromNodeID string, frameType uint8, payload []byte) error {
@@ -610,45 +690,6 @@ func (c *ClusterCoordinator) HandleIncomingFrame(fromNodeID string, frameType ui
 			return fmt.Errorf("unmarshal CortexClaim: %w", err)
 		}
 		c.election.HandleCortexClaim(claim)
-		return nil
-
-	case mbp.TypeJoinRequest:
-		var req mbp.JoinRequest
-		if err := msgpack.Unmarshal(payload, &req); err != nil {
-			return fmt.Errorf("unmarshal JoinRequest: %w", err)
-		}
-		peer, ok := c.mgr.GetPeer(fromNodeID)
-		if !ok {
-			// Create a peer for the joining node
-			c.mgr.AddPeer(req.NodeID, req.Addr)
-			peer, ok = c.mgr.GetPeer(req.NodeID)
-			if !ok {
-				return errors.New("failed to create peer for joining node")
-			}
-		}
-		resp := c.joinHandler.HandleJoinRequest(req, peer)
-		respPayload, err := msgpack.Marshal(resp)
-		if err != nil {
-			return fmt.Errorf("marshal JoinResponse: %w", err)
-		}
-		_ = peer.Send(mbp.TypeJoinResponse, respPayload)
-
-		// Phase 2: stream snapshot immediately after JoinResponse on same conn.
-		if resp.NeedsSnapshot {
-			c.IncrementSnapshotCount()
-			go func() {
-				defer c.DecrementSnapshotCount()
-				ctx := context.Background()
-				if _, err := c.joinHandler.StreamSnapshot(ctx, peer); err != nil {
-					slog.Error("cluster: snapshot stream failed; closing connection so lobe can reconnect and retry",
-						"lobe", req.NodeID, "err", err)
-					// Close the connection so the Lobe's blocking reads return an
-					// error immediately. Without this, the Lobe waits forever for
-					// a snapshot that was never completed.
-					_ = peer.Close()
-				}
-			}()
-		}
 		return nil
 
 	case mbp.TypeLeave:

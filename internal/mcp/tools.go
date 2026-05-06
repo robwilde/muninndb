@@ -8,7 +8,7 @@ func allToolDefinitions() []ToolDefinition {
 	return []ToolDefinition{
 		{
 			Name:        "muninn_remember",
-			Description: "Store a new piece of information (engram) in long-term memory. IMPORTANT: Keep each memory atomic — one concept, decision, or fact per memory. If a conversation covers multiple topics, use muninn_remember_batch to store them as separate memories. Atomic memories produce sharper recall, better associations, and more accurate contradiction detection. TIP: Provide ‘entities’ and ‘entity_relationships’ whenever you can identify them — this builds the knowledge graph immediately without requiring background enrichment.",
+			Description: "Store a new piece of information (engram) in long-term memory. IMPORTANT: Keep each memory atomic — one concept, decision, or fact per memory. If a conversation covers multiple topics, use muninn_remember_batch to store them as separate memories. Atomic memories produce sharper recall, better associations, and more accurate contradiction detection. TIP: Provide ‘entities’ and ‘entity_relationships’ whenever you can identify them — this builds the knowledge graph immediately without requiring background enrichment. NOTE: If the exact same content already exists in the vault, the existing memory ID is returned instead of creating a duplicate.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -63,6 +63,11 @@ func allToolDefinitions() []ToolDefinition {
 					"op_id": map[string]any{
 						"type":        "string",
 						"description": "Optional idempotency key. If set and a receipt exists for this key, the cached engram ID is returned without re-creating.",
+					},
+					"embedding": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "number"},
+						"description": "Optional pre-computed embedding vector (array of floats). When provided, the server skips its own embedding step and uses this vector directly. The dimension must match the vault's existing embedding dimension, or the call will be rejected. Omit to let the server embed via its configured provider.",
 					},
 				},
 				"required": []string{"content"},
@@ -128,6 +133,11 @@ func allToolDefinitions() []ToolDefinition {
 									},
 									"description": "Typed entity-to-entity relationships for this memory.",
 								},
+								"embedding": map[string]any{
+									"type":        "array",
+									"items":       map[string]any{"type": "number"},
+									"description": "Optional pre-computed embedding vector for this memory. Must match the vault's embedding dimension.",
+								},
 							},
 							"required": []string{"content"},
 						},
@@ -163,13 +173,22 @@ func allToolDefinitions() []ToolDefinition {
 						"type":        "string",
 						"description": "ISO 8601 timestamp (e.g. 2026-01-20T00:00:00Z). Only return memories created before this time.",
 					},
+					"embedding": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "number"},
+						"description": "Optional pre-computed query embedding vector (array of floats). When provided, the server uses this vector for semantic search instead of computing one from 'context'. The dimension must match the vault's existing embedding dimension, or the call will be rejected.",
+					},
+					"annotate": map[string]any{
+						"type":        "boolean",
+						"description": "When true, each result includes an annotations object with staleness, conflict, and supersession metadata. Default false.",
+					},
 				},
 				"required": []string{"context"},
 			},
 		},
 		{
 			Name:        "muninn_read",
-			Description: "Fetch a single memory by its ID.",
+			Description: "Fetch a single memory by its ID. Returns full content plus any caller-provided entities (name, type) and entity relationships (from_entity, to_entity, rel_type) that were stored with the memory. Engine-generated co-occurrence data is excluded; use muninn_entity for that.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -241,6 +260,11 @@ func allToolDefinitions() []ToolDefinition {
 					"id":          map[string]any{"type": "string", "description": "ID of the memory to evolve."},
 					"new_content": map[string]any{"type": "string", "description": "Updated information."},
 					"reason":      map[string]any{"type": "string", "description": "Why this memory is being updated."},
+					"embedding": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "number"},
+						"description": "Optional pre-computed embedding vector for the new version. When provided, the server skips its own embedding step. Must match the vault's existing embedding dimension.",
+					},
 				},
 				"required": []string{"id", "new_content", "reason"},
 			},
@@ -323,6 +347,11 @@ func allToolDefinitions() []ToolDefinition {
 					"vault":     vaultProp,
 					"engram_id": map[string]any{"type": "string", "description": "ID of the memory to score-explain."},
 					"query":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Context phrases to evaluate against (same format as muninn_recall context)."},
+					"embedding": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "number"},
+						"description": "Optional pre-computed query embedding vector. When provided, used for the semantic similarity component instead of embedding the query strings server-side. Required for accurate semantic scores in zero-config mode.",
+					},
 				},
 				"required": []string{"engram_id", "query"},
 			},
@@ -363,6 +392,79 @@ func allToolDefinitions() []ToolDefinition {
 					"id":    map[string]any{"type": "string", "description": "ID of the memory to re-enrich."},
 				},
 				"required": []string{"id"},
+			},
+		},
+		{
+			Name:        "muninn_get_enrichment_candidates",
+			Description: "Return active memories that are missing one or more enrichment stages so an external MCP agent can enrich them without using the server-side enrich plugin.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"vault": vaultProp,
+					"stages": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "string", "enum": []string{"entities", "relationships", "classification", "summary"}},
+						"description": "Which enrichment stages to look for. Defaults to all four stages.",
+					},
+					"limit": map[string]any{
+						"type":        "integer",
+						"description": "Maximum number of candidate memories to return in this call (default 50, max 200).",
+					},
+					"cursor": map[string]any{
+						"type":        "string",
+						"description": "Opaque pagination cursor returned by a previous call as next_cursor. Omit or pass an empty string to start from the beginning.",
+					},
+				},
+				"required": []string{},
+			},
+		},
+		{
+			Name:        "muninn_apply_enrichment",
+			Description: "Persist externally generated enrichment output for a single memory. Use this after an MCP agent reads candidates, generates summary/entities/relationships itself, and writes results back without relying on the server-side enrich plugin.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"vault":               vaultProp,
+					"id":                  map[string]any{"type": "string", "description": "ID of the memory to update."},
+					"expected_updated_at": map[string]any{"type": "string", "description": "RFC3339Nano timestamp from the candidate response. Prevents stale overwrites."},
+					"summary":             map[string]any{"type": "string", "description": "Optional generated summary."},
+					"memory_type":         map[string]any{"type": "string", "description": "Optional generated memory type."},
+					"type_label":          map[string]any{"type": "string", "description": "Optional generated free-form type label."},
+					"entities": map[string]any{
+						"type":        "array",
+						"description": "Optional extracted entities to persist.",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"name":       map[string]any{"type": "string"},
+								"type":       map[string]any{"type": "string"},
+								"confidence": map[string]any{"type": "number"},
+							},
+							"required": []string{"name", "type"},
+						},
+					},
+					"relationships": map[string]any{
+						"type":        "array",
+						"description": "Optional extracted entity relationships to persist.",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"from_entity": map[string]any{"type": "string"},
+								"to_entity":   map[string]any{"type": "string"},
+								"rel_type":    map[string]any{"type": "string"},
+								"weight":      map[string]any{"type": "number"},
+							},
+							"required": []string{"from_entity", "to_entity", "rel_type"},
+						},
+					},
+					"stages_completed": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "string", "enum": []string{"entities", "relationships", "classification", "summary"}},
+						"description": "Optional explicit stage list to mark complete even when the generated output for a stage is empty.",
+					},
+					"source": map[string]any{"type": "string", "description": "Optional provenance/source label for the applied enrichment (default: mcp_agent)."},
+				},
+				"required": []string{"id", "expected_updated_at"},
 			},
 		},
 		{
@@ -408,16 +510,43 @@ func allToolDefinitions() []ToolDefinition {
 		// Entity lifecycle state tool
 		{
 			Name:        "muninn_entity_state",
-			Description: "Set the lifecycle state of a named entity (active, deprecated, merged, resolved). For state=merged, provide merged_into with the canonical entity name.",
+			Description: "Set the lifecycle state of a named entity (active, deprecated, merged, resolved) and optionally correct its type. For state=merged, provide merged_into with the canonical entity name. The type field is optional — omit it to preserve the existing type.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"entity_name": map[string]any{"type": "string", "description": "The entity name to update"},
 					"state":       map[string]any{"type": "string", "description": "New state: active, deprecated, merged, or resolved"},
 					"merged_into": map[string]any{"type": "string", "description": "Canonical entity name (required when state=merged)"},
+					"type":        map[string]any{"type": "string", "description": "Correct the entity type (e.g. 'directive', 'protocol', 'module'). Omit to preserve the existing type."},
 					"vault":       vaultProp,
 				},
 				"required": []string{"entity_name", "state"},
+			},
+		},
+		// Batch entity lifecycle state tool
+		{
+			Name:        "muninn_entity_state_batch",
+			Description: "Update lifecycle state (and optionally type) for multiple entities in one call. More efficient than calling muninn_entity_state repeatedly. Maximum 50 per batch. Partial success supported — check per-item status in results.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"vault": vaultProp,
+					"operations": map[string]any{
+						"type":        "array",
+						"description": "Array of entity state operations (max 50).",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"entity_name": map[string]any{"type": "string", "description": "Entity name to update"},
+								"state":       map[string]any{"type": "string", "description": "New state: active, deprecated, merged, or resolved"},
+								"merged_into": map[string]any{"type": "string", "description": "Canonical entity name (required when state=merged)"},
+								"type":        map[string]any{"type": "string", "description": "Correct the entity type. Omit to preserve existing."},
+							},
+							"required": []string{"entity_name", "state"},
+						},
+					},
+				},
+				"required": []string{"operations"},
 			},
 		},
 		// Hierarchical memory tools
@@ -546,6 +675,11 @@ func allToolDefinitions() []ToolDefinition {
 					"type":      map[string]any{"type": "string", "description": "Memory type (task, goal, etc.)."},
 					"tags":      map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 					"ordinal":   map[string]any{"type": "integer", "description": "Explicit ordinal position. Omit to append at end."},
+					"embedding": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "number"},
+						"description": "Optional pre-computed embedding vector for this child. Must match the vault's existing embedding dimension.",
+					},
 				},
 				"required": []string{"parent_id", "concept", "content"},
 			},
@@ -669,6 +803,30 @@ func allToolDefinitions() []ToolDefinition {
 					"state": map[string]any{"type": "string", "description": "Filter by state: active, deprecated, merged, resolved"},
 				},
 				"required": []string{},
+			},
+		},
+		// Trust label
+		{
+			Name:        "muninn_trust",
+			Description: "Set the trust level of an engram. Trust levels control how much confidence to place in a memory. Use 'verified' for human-confirmed facts, 'inferred' for AI-generated memories (default), 'external' for imported data, and 'untrusted' to flag unreliable memories. Untrusted memories can be excluded from recall by enabling ExcludeUntrusted in vault config.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id": map[string]any{
+						"type":        "string",
+						"description": "ULID of the engram to update",
+					},
+					"trust": map[string]any{
+						"type":        "string",
+						"enum":        []string{"verified", "inferred", "external", "untrusted"},
+						"description": "Trust level to assign",
+					},
+					"vault": map[string]any{
+						"type":        "string",
+						"description": "Vault containing the engram (default: \"default\")",
+					},
+				},
+				"required": []string{"id", "trust"},
 			},
 		},
 	}

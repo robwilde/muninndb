@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/scrypster/muninndb/internal/auth"
+	"github.com/scrypster/muninndb/internal/storage"
 	"github.com/scrypster/muninndb/internal/transport/mbp"
 )
 
@@ -134,6 +135,99 @@ func TestEngineDeleteVault_GlobalEngramCountDecreases(t *testing.T) {
 	}
 }
 
+func TestEngineDeleteVault_RemovesEntityGraph(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	const deletedVault = "delete-entity-graph-a"
+	const keptVault = "delete-entity-graph-b"
+
+	respA, err := eng.Write(ctx, writeReq(deletedVault, "delete me", "content a"))
+	if err != nil {
+		t.Fatalf("Write deleted vault: %v", err)
+	}
+	respB, err := eng.Write(ctx, writeReq(keptVault, "keep me", "content b"))
+	if err != nil {
+		t.Fatalf("Write kept vault: %v", err)
+	}
+	idA, err := storage.ParseULID(respA.ID)
+	if err != nil {
+		t.Fatalf("ParseULID A: %v", err)
+	}
+	idB, err := storage.ParseULID(respB.ID)
+	if err != nil {
+		t.Fatalf("ParseULID B: %v", err)
+	}
+	wsA := eng.store.ResolveVaultPrefix(deletedVault)
+	wsB := eng.store.ResolveVaultPrefix(keptVault)
+
+	for _, name := range []string{"SharedEntity", "OnlyDeletedVault", "SharedEntity", "OnlyKeptVault"} {
+		if err := eng.store.UpsertEntityRecord(ctx, storage.EntityRecord{Name: name, Type: "test", Confidence: 1}, "test"); err != nil {
+			t.Fatalf("UpsertEntityRecord %q: %v", name, err)
+		}
+	}
+	if err := eng.store.WriteEntityEngramLink(ctx, wsA, idA, "SharedEntity"); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.store.WriteEntityEngramLink(ctx, wsA, idA, "OnlyDeletedVault"); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.store.WriteEntityEngramLink(ctx, wsB, idB, "SharedEntity"); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.store.WriteEntityEngramLink(ctx, wsB, idB, "OnlyKeptVault"); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.store.UpsertRelationshipRecord(ctx, wsA, idA, storage.RelationshipRecord{FromEntity: "SharedEntity", ToEntity: "OnlyDeletedVault", RelType: "uses", Weight: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.store.UpsertRelationshipRecord(ctx, wsB, idB, storage.RelationshipRecord{FromEntity: "SharedEntity", ToEntity: "OnlyKeptVault", RelType: "uses", Weight: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := eng.DeleteVault(ctx, deletedVault); err != nil {
+		t.Fatalf("DeleteVault: %v", err)
+	}
+
+	deletedEntities, err := eng.ListEntities(ctx, deletedVault, 50, "")
+	if err != nil {
+		t.Fatalf("ListEntities deleted vault: %v", err)
+	}
+	if len(deletedEntities) != 0 {
+		t.Fatalf("expected deleted vault to have no entities, got %+v", deletedEntities)
+	}
+	deletedRefs, err := eng.FindByEntity(ctx, deletedVault, "SharedEntity", 50)
+	if err != nil {
+		t.Fatalf("FindByEntity deleted vault: %v", err)
+	}
+	if len(deletedRefs) != 0 {
+		t.Fatalf("expected deleted vault to have no SharedEntity refs, got %d", len(deletedRefs))
+	}
+	onlyDeleted, err := eng.store.GetEntityRecord(ctx, "OnlyDeletedVault")
+	if err != nil {
+		t.Fatalf("GetEntityRecord OnlyDeletedVault: %v", err)
+	}
+	if onlyDeleted != nil {
+		t.Fatalf("expected orphan entity to be removed, got %+v", onlyDeleted)
+	}
+
+	keptEntities, err := eng.ListEntities(ctx, keptVault, 50, "")
+	if err != nil {
+		t.Fatalf("ListEntities kept vault: %v", err)
+	}
+	if len(keptEntities) != 2 {
+		t.Fatalf("expected kept vault entities to remain, got %+v", keptEntities)
+	}
+	keptRefs, err := eng.FindByEntity(ctx, keptVault, "SharedEntity", 50)
+	if err != nil {
+		t.Fatalf("FindByEntity kept vault: %v", err)
+	}
+	if len(keptRefs) != 1 || keptRefs[0].ID != idB {
+		t.Fatalf("expected kept vault SharedEntity ref to remain, got %+v", keptRefs)
+	}
+}
+
 func TestEngineClearVault_NotFound(t *testing.T) {
 	eng, cleanup := testEnv(t)
 	defer cleanup()
@@ -166,8 +260,9 @@ func TestClearVault_Idempotent(t *testing.T) {
 	const vaultName = "idempotent-clear-vault"
 
 	// Write 3 engrams using eng.Write — this also registers the vault name.
+	// Unique content to avoid content-hash dedup.
 	for i := 0; i < 3; i++ {
-		if _, err := eng.Write(ctx, writeReq(vaultName, "concept", "content")); err != nil {
+		if _, err := eng.Write(ctx, writeReq(vaultName, "concept", fmt.Sprintf("content %d", i))); err != nil {
 			t.Fatalf("Write[%d]: %v", i, err)
 		}
 	}
@@ -365,9 +460,9 @@ func TestEngineRenameVault_CoherenceCountersMoved(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	// Write a few engrams to build up coherence counters.
+	// Write a few engrams to build up coherence counters (unique content to avoid content-hash dedup).
 	for i := 0; i < 3; i++ {
-		if _, err := eng.Write(ctx, writeReq("coh-rename-src", "concept", "content")); err != nil {
+		if _, err := eng.Write(ctx, writeReq("coh-rename-src", "concept", fmt.Sprintf("content %d", i))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -440,10 +535,9 @@ func TestEngineRenameVault_VaultMuMoved(t *testing.T) {
 	}
 }
 
-// TestEngineRenameVault_ClosedDB verifies that RenameVault fails when the
-// underlying Pebble DB is closed. Pebble panics with ErrClosed rather than
-// returning an error, so we recover and verify the panic value.
-func TestEngineRenameVault_ClosedDB(t *testing.T) {
+// TestEngineRenameVault_AfterStop verifies that RenameVault fails fast once the
+// engine is shutting down, even if Pebble has already been closed underneath it.
+func TestEngineRenameVault_AfterStop(t *testing.T) {
 	eng, cleanup := testEnv(t)
 	defer cleanup() // safe — PebbleStore.Close is idempotent via sync.Once
 	ctx := context.Background()
@@ -456,29 +550,13 @@ func TestEngineRenameVault_ClosedDB(t *testing.T) {
 
 	// Stop background workers first to avoid panics from closed DB.
 	eng.Stop()
-	// Close the underlying Pebble DB so that ListVaultNames will fail.
+	// Close the underlying Pebble DB after Stop() to simulate teardown. The
+	// shutdown guard should fail fast before the code touches Pebble again.
 	eng.store.Close()
 
-	// Pebble panics (rather than returning an error) when the DB is closed,
-	// so we recover the panic and verify it contains the expected message.
-	var panicked bool
-	var panicVal any
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				panicked = true
-				panicVal = r
-			}
-		}()
-		eng.RenameVault(ctx, "db-close-vault", "new-vault")
-	}()
-
-	if !panicked {
-		t.Fatal("expected panic on closed DB, but RenameVault returned normally")
-	}
-	msg := fmt.Sprintf("%v", panicVal)
-	if !strings.Contains(msg, "closed") {
-		t.Errorf("expected panic message containing 'closed', got: %v", panicVal)
+	err := eng.RenameVault(ctx, "db-close-vault", "new-vault")
+	if err == nil || !strings.Contains(err.Error(), "engine is shutting down") {
+		t.Fatalf("err = %v, want engine is shutting down", err)
 	}
 }
 

@@ -49,7 +49,7 @@ func (f *fakeEngine) Stat(ctx context.Context, req *mbp.StatRequest) (*mbp.StatR
 func (f *fakeEngine) GetContradictions(ctx context.Context, vault string) ([]ContradictionPair, error) {
 	return nil, nil
 }
-func (f *fakeEngine) Evolve(ctx context.Context, vault, oldID, newContent, reason string) (*WriteResult, error) {
+func (f *fakeEngine) Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string) (*WriteResult, error) {
 	return &WriteResult{ID: "new-id"}, nil
 }
 func (f *fakeEngine) Consolidate(ctx context.Context, vault string, ids []string, merged string) (*ConsolidateResult, error) {
@@ -80,6 +80,21 @@ func (f *fakeEngine) ListDeleted(ctx context.Context, vault string, limit int) (
 }
 func (f *fakeEngine) RetryEnrich(ctx context.Context, vault string, id string) (*RetryEnrichResult, error) {
 	return &RetryEnrichResult{EngramID: id, PluginsQueued: []string{}, AlreadyComplete: []string{}}, nil
+}
+func (f *fakeEngine) GetEnrichmentCandidates(_ context.Context, _ string, stages []string, _ string, _ int) (*EnrichmentCandidatesResult, error) {
+	if len(stages) == 0 {
+		stages = []string{"entities", "relationships", "classification", "summary"}
+	}
+	return &EnrichmentCandidatesResult{Items: []EnrichmentCandidate{}, StagesRequested: stages, Count: 0}, nil
+}
+func (f *fakeEngine) ApplyEnrichment(_ context.Context, _ string, req *ApplyEnrichmentRequest) (*ApplyEnrichmentResult, error) {
+	return &ApplyEnrichmentResult{
+		ID:            req.ID,
+		Status:        "applied",
+		AppliedStages: req.StagesCompleted,
+		UpdatedAt:     time.Now().UTC().Format(time.RFC3339Nano),
+		DigestFlags:   map[string]bool{},
+	}, nil
 }
 func (f *fakeEngine) GetVaultPlasticity(_ context.Context, _ string) (*auth.ResolvedPlasticity, error) {
 	r := auth.ResolvePlasticity(nil)
@@ -112,8 +127,11 @@ func (f *fakeEngine) CheckIdempotency(_ context.Context, _ string) (*storage.Ide
 func (f *fakeEngine) WriteIdempotency(_ context.Context, _, _ string) error {
 	return nil
 }
-func (f *fakeEngine) SetEntityState(_ context.Context, _, _, _ string) error {
+func (f *fakeEngine) SetEntityState(_ context.Context, _, _, _, _ string) error {
 	return nil
+}
+func (f *fakeEngine) SetEntityStateBatch(_ context.Context, ops []engine.EntityStateOp) []error {
+	return make([]error, len(ops))
 }
 func (f *fakeEngine) GetEntityClusters(_ context.Context, _ string, _, _ int) ([]EntityClusterResult, error) {
 	return []EntityClusterResult{}, nil
@@ -159,9 +177,17 @@ func (f *fakeEngine) GetEntityAggregate(_ context.Context, _, _ string, _ int) (
 func (f *fakeEngine) ListEntities(_ context.Context, _ string, _ int, _ string) ([]EntitySummary, error) {
 	return []EntitySummary{}, nil
 }
+func (f *fakeEngine) GetVaultEmbedDim(_ context.Context, _ string) int {
+	return 0
+}
+func (f *fakeEngine) SetTrust(_ context.Context, _, _, _ string) error { return nil }
+
+func (f *fakeEngine) GetAnnotations(_ context.Context, _, _ string) (*engine.AnnotationData, error) {
+	return nil, nil
+}
 
 func newTestServer() *MCPServer {
-	return New(":0", &fakeEngine{}, "", nil)
+	return New(":0", &fakeEngine{}, "", nil, nil)
 }
 
 func postRPC(t *testing.T, srv *MCPServer, body string) *httptest.ResponseRecorder {
@@ -257,8 +283,8 @@ func TestListTools(t *testing.T) {
 	var result map[string]any
 	json.NewDecoder(w.Body).Decode(&result)
 	tools, _ := result["tools"].([]any)
-	if len(tools) != 35 {
-		t.Errorf("expected 35 tools, got %d", len(tools))
+	if len(tools) != 39 {
+		t.Errorf("expected 39 tools, got %d", len(tools))
 	}
 }
 
@@ -421,10 +447,10 @@ func TestHandleSessionInvalidSince(t *testing.T) {
 
 func TestApplyTypeArgs(t *testing.T) {
 	tests := []struct {
-		name       string
-		args       map[string]any
-		wantType   uint8
-		wantLabel  string
+		name      string
+		args      map[string]any
+		wantType  uint8
+		wantLabel string
 	}{
 		{
 			name:      "enum name sets both type and label",
@@ -492,8 +518,8 @@ func TestApplyEnrichmentArgs(t *testing.T) {
 		wantRels     int
 	}{
 		{
-			name:    "no enrichment fields",
-			args:    map[string]any{},
+			name: "no enrichment fields",
+			args: map[string]any{},
 		},
 		{
 			name:        "summary only",
@@ -540,9 +566,9 @@ func TestApplyEnrichmentArgs(t *testing.T) {
 			args: map[string]any{
 				"entities": []any{
 					map[string]any{"name": "Valid", "type": "tool"},
-					map[string]any{"name": "", "type": "tool"},       // empty name
-					map[string]any{"name": "NoType"},                  // missing type
-					"not an object",                                   // wrong type
+					map[string]any{"name": "", "type": "tool"}, // empty name
+					map[string]any{"name": "NoType"},           // missing type
+					"not an object",                            // wrong type
 				},
 			},
 			wantEntities: 1,
@@ -552,8 +578,8 @@ func TestApplyEnrichmentArgs(t *testing.T) {
 			args: map[string]any{
 				"relationships": []any{
 					map[string]any{"target_id": "01ABC", "relation": "supports"},
-					map[string]any{"target_id": "", "relation": "supports"},        // empty target
-					map[string]any{"target_id": "01ABC", "relation": ""},           // empty relation
+					map[string]any{"target_id": "", "relation": "supports"}, // empty target
+					map[string]any{"target_id": "01ABC", "relation": ""},    // empty relation
 				},
 			},
 			wantRels: 1,

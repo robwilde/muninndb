@@ -24,7 +24,7 @@ func TestKeyPrefixesAreUnique(t *testing.T) {
 		{"MetaKey", MetaKey(ws, id)},
 		{"AssocFwdKey", AssocFwdKey(ws, id, 0.5, id)},
 		{"AssocRevKey", AssocRevKey(ws, id, 0.5, id)},
-		{"FTSPostingKey", FTSPostingKey(ws, "test", id)},
+		{"FTSPostingKey", FTSPostingKey(ws, "test", 0x01, id)},
 		{"TrigramKey", TrigramKey(ws, trigram, id)},
 		{"HNSWNodeKey", HNSWNodeKey(ws, id, 0)},
 		{"FTSStatsKey", FTSStatsKey(ws)},
@@ -52,6 +52,7 @@ func TestKeyPrefixesAreUnique(t *testing.T) {
 		{"RelationshipKey", RelationshipKey([8]byte{}, [16]byte{}, [8]byte{}, 0x01, [8]byte{})},
 		{"EntityReverseIndexKey", EntityReverseIndexKey([8]byte{}, [8]byte{}, [16]byte{})},
 		{"LastAccessIndexKey", LastAccessIndexKey([8]byte{}, 0, [16]byte{})},
+		{"DreamStateKey", DreamStateKey([8]byte{1, 2, 3, 4, 5, 6, 7, 8})},
 	}
 
 	seen := make(map[byte]string)

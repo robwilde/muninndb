@@ -75,8 +75,9 @@ type Engram struct {
 	Summary        string    // extractive first 2 sentences
 	KeyPoints      []string  // top 5 sentences by IDF rarity
 	MemoryType     MemoryType
-	TypeLabel      string // free-form label, e.g. "architectural_decision", "coding_pattern"
-	Classification uint16 // concept-cluster ID
+	TypeLabel      string     // free-form label, e.g. "architectural_decision", "coding_pattern"
+	Classification uint16     // concept-cluster ID
+	Trust          TrustLevel // provenance confidence label (OffsetTrust in ERF)
 }
 
 // EngramMeta is the 100-byte fixed metadata section.
@@ -124,6 +125,32 @@ const (
 	StateArchived    LifecycleState = 0x06
 	StateSoftDeleted LifecycleState = 0x7F
 )
+
+// String returns the human-readable name for a LifecycleState value.
+// It is the inverse of ParseLifecycleState and is the single source of
+// truth for state labels used by the REST, MCP, and embedded SDK layers.
+func (s LifecycleState) String() string {
+	switch s {
+	case StatePlanning:
+		return "planning"
+	case StateActive:
+		return "active"
+	case StatePaused:
+		return "paused"
+	case StateBlocked:
+		return "blocked"
+	case StateCompleted:
+		return "completed"
+	case StateCancelled:
+		return "cancelled"
+	case StateArchived:
+		return "archived"
+	case StateSoftDeleted:
+		return "soft_deleted"
+	default:
+		return fmt.Sprintf("unknown(%d)", uint8(s))
+	}
+}
 
 // ParseLifecycleState parses a string lifecycle state name.
 func ParseLifecycleState(s string) (LifecycleState, error) {
@@ -260,6 +287,56 @@ func ParseMemoryType(s string) (MemoryType, bool) {
 		return TypeReference, true
 	default:
 		return TypeFact, false
+	}
+}
+
+// TrustLevel encodes the provenance confidence of an engram's content (uint8 on disk, offset 71).
+// 0x00 (TrustUnset) is the zero value for backward compatibility — all existing engrams read as "inferred".
+type TrustLevel uint8
+
+const (
+	TrustUnset     TrustLevel = 0x00 // zero value; displays as "inferred" for existing records
+	TrustVerified  TrustLevel = 0x01 // human-confirmed or admin-certified
+	TrustInferred  TrustLevel = 0x02 // AI-generated or system-inferred (default on new writes)
+	TrustExternal  TrustLevel = 0x03 // imported from an external system
+	TrustUntrusted TrustLevel = 0x04 // flagged as unreliable
+)
+
+// String returns the canonical string label for a TrustLevel.
+// TrustUnset and unknown values return "inferred" for display purposes.
+func (t TrustLevel) String() string {
+	switch t {
+	case TrustVerified:
+		return "verified"
+	case TrustInferred:
+		return "inferred"
+	case TrustExternal:
+		return "external"
+	case TrustUntrusted:
+		return "untrusted"
+	default: // TrustUnset (0x00) and unknown values — display as "inferred" for backward compatibility
+		return "inferred"
+	}
+}
+
+// ParseTrustLevel parses a trust level string into a TrustLevel.
+// Returns an error for unrecognized strings.
+// Note: "inferred" maps to TrustInferred (0x02), not TrustUnset (0x00).
+// Existing engrams with TrustUnset (zero-initialized) display as "inferred" via String()
+// but ParseTrustLevel will produce TrustInferred when written back — both are semantically
+// equivalent and the distinction is invisible to clients.
+func ParseTrustLevel(s string) (TrustLevel, error) {
+	switch s {
+	case "verified":
+		return TrustVerified, nil
+	case "inferred":
+		return TrustInferred, nil
+	case "external":
+		return TrustExternal, nil
+	case "untrusted":
+		return TrustUntrusted, nil
+	default:
+		return 0, fmt.Errorf("unknown trust level %q: must be one of verified, inferred, external, untrusted", s)
 	}
 }
 

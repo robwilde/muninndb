@@ -99,6 +99,47 @@ func readLeaveMessage(t *testing.T, conn net.Conn) mbp.LeaveMessage {
 
 // ---- JoinHandler tests ----
 
+// TestJoinHandler_HandleJoinRequest_DoesNotFireCallback verifies the deferred-
+// callback contract: HandleJoinRequest must NOT fire OnLobeJoined inline. If it
+// did, the NetworkStreamer spawned by the callback would race the caller's
+// JoinResponse send on the shared PeerConn — the streamer's first ReplEntry
+// frame can overtake the JoinResponse frame, corrupting the lobe-side
+// handshake parser ("unexpected frame type 0x..."). Callers must invoke
+// FireOnLobeJoined explicitly after JoinResponse (+ Snapshot) is on the wire.
+func TestJoinHandler_HandleJoinRequest_DoesNotFireCallback(t *testing.T) {
+	es := newTestEpochStore(t)
+	if err := es.ForceSet(3); err != nil {
+		t.Fatalf("ForceSet: %v", err)
+	}
+	repLog := newTestRepLog(t)
+	mgr := NewConnManager("cortex-1")
+	handler := NewJoinHandler("cortex-1", "", es, repLog, mgr)
+
+	var cbFired bool
+	handler.OnLobeJoined = func(info NodeInfo) { cbFired = true }
+
+	req := mbp.JoinRequest{
+		NodeID:          "lobe-1",
+		Addr:            "127.0.0.1:9001",
+		ProtocolVersion: mbp.CurrentProtocolVersion,
+	}
+	cortexConn, lobeConn := net.Pipe()
+	t.Cleanup(func() { cortexConn.Close(); lobeConn.Close() })
+	peer := mgr.RegisterConn(req.NodeID, req.Addr, cortexConn)
+
+	resp := handler.HandleJoinRequest(req, peer)
+	if !resp.Accepted {
+		t.Fatalf("expected Accepted=true, got %q", resp.RejectReason)
+	}
+	if cbFired {
+		t.Fatal("OnLobeJoined fired inline during HandleJoinRequest — would race JoinResponse on wire")
+	}
+	handler.FireOnLobeJoined(req.NodeID)
+	if !cbFired {
+		t.Fatal("FireOnLobeJoined did not invoke callback")
+	}
+}
+
 func TestJoinHandler_HandleJoinRequest_Success(t *testing.T) {
 	es := newTestEpochStore(t)
 	// Set a non-zero epoch so the handler accepts joins.
@@ -116,12 +157,19 @@ func TestJoinHandler_HandleJoinRequest_Success(t *testing.T) {
 	}
 
 	req := mbp.JoinRequest{
-		NodeID:      "lobe-1",
-		Addr:        "127.0.0.1:9001",
-		LastApplied: 0,
+		NodeID:          "lobe-1",
+		Addr:            "127.0.0.1:9001",
+		LastApplied:     0,
+		ProtocolVersion: mbp.CurrentProtocolVersion,
 	}
 
-	resp := handler.HandleJoinRequest(req, nil)
+	// Simulate what the coordinator does: register the live inbound conn BEFORE
+	// calling HandleJoinRequest, then pass that PeerConn into the handler.
+	cortexConn, lobeConn := net.Pipe()
+	t.Cleanup(func() { cortexConn.Close(); lobeConn.Close() })
+	peer := mgr.RegisterConn(req.NodeID, req.Addr, cortexConn)
+
+	resp := handler.HandleJoinRequest(req, peer)
 
 	if !resp.Accepted {
 		t.Fatalf("expected Accepted=true, got false: %s", resp.RejectReason)
@@ -142,14 +190,86 @@ func TestJoinHandler_HandleJoinRequest_Success(t *testing.T) {
 		t.Errorf("member NodeID = %q, want lobe-1", members[0].NodeID)
 	}
 
-	// OnLobeJoined callback should have been called.
+	// OnLobeJoined is deferred — caller must fire it after JoinResponse
+	// (+ optional Snapshot) is written to the wire. See FireOnLobeJoined doc.
+	handler.FireOnLobeJoined(req.NodeID)
 	if joinedInfo.NodeID != "lobe-1" {
 		t.Errorf("joinedInfo.NodeID = %q, want lobe-1", joinedInfo.NodeID)
 	}
 
-	// Peer should be registered in ConnManager.
-	if _, ok := mgr.GetPeer("lobe-1"); !ok {
-		t.Error("lobe-1 not registered in ConnManager")
+	// The peer registered before HandleJoinRequest must still be connected —
+	// HandleJoinRequest must NOT call AddPeer (which would close the live conn).
+	if !peer.IsConnected() {
+		t.Error("PeerConn is not connected after HandleJoinRequest — AddPeer must not be called inside HandleJoinRequest")
+	}
+	p, ok := mgr.GetPeer("lobe-1")
+	if !ok {
+		t.Error("lobe-1 not found in ConnManager")
+	}
+	if p != peer {
+		t.Error("ConnManager returned a different PeerConn — live conn was replaced")
+	}
+}
+
+// TestJoinHandler_HandleJoinRequest_LiveConnPreserved is a regression test for
+// the bug where HandleJoinRequest called h.mgr.AddPeer(), closing the live
+// inbound PeerConn that the coordinator registered via RegisterConn before
+// invoking HandleJoinRequest. After the fix, the live conn must survive the
+// call and remain usable for peer.Send().
+func TestJoinHandler_HandleJoinRequest_LiveConnPreserved(t *testing.T) {
+	es := newTestEpochStore(t)
+	if err := es.ForceSet(1); err != nil {
+		t.Fatalf("ForceSet: %v", err)
+	}
+
+	repLog := newTestRepLog(t)
+	mgr := NewConnManager("cortex-1")
+	handler := NewJoinHandler("cortex-1", "", es, repLog, mgr)
+
+	req := mbp.JoinRequest{
+		NodeID:          "test-lobe",
+		Addr:            "127.0.0.1:9100",
+		LastApplied:     0,
+		ProtocolVersion: mbp.CurrentProtocolVersion,
+	}
+
+	// Simulate coordinator: register the live inbound conn first.
+	cortexSide, lobeSide := net.Pipe()
+	t.Cleanup(func() { cortexSide.Close(); lobeSide.Close() })
+	peer := mgr.RegisterConn(req.NodeID, req.Addr, cortexSide)
+
+	// Drain the lobe side in the background so peer.Send doesn't block.
+	readErrs := make(chan error, 1)
+	go func() {
+		f, err := mbp.ReadFrame(lobeSide)
+		_ = f
+		readErrs <- err
+	}()
+
+	resp := handler.HandleJoinRequest(req, peer)
+	if !resp.Accepted {
+		t.Fatalf("HandleJoinRequest rejected: %s", resp.RejectReason)
+	}
+
+	// The live conn must still be open — not closed by AddPeer inside HandleJoinRequest.
+	if !peer.IsConnected() {
+		t.Fatal("regression: PeerConn was closed inside HandleJoinRequest (AddPeer called on live conn)")
+	}
+
+	// Send must succeed; before the fix it returned ErrNotConnected.
+	payload := []byte("ping")
+	if err := peer.Send(mbp.TypePing, payload); err != nil {
+		t.Fatalf("peer.Send after HandleJoinRequest: %v (regression: AddPeer closed the live conn)", err)
+	}
+
+	// Verify the lobe side received the frame.
+	select {
+	case err := <-readErrs:
+		if err != nil {
+			t.Fatalf("lobe side read error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for frame on lobe side")
 	}
 }
 
@@ -305,10 +425,10 @@ func TestJoinClient_Join_Success(t *testing.T) {
 	client := NewJoinClient("lobe-1", "127.0.0.1:9100", "", es, nil, mgr)
 
 	serverResp := mbp.JoinResponse{
-		Accepted: true,
-		CortexID: "cortex-1",
+		Accepted:   true,
+		CortexID:   "cortex-1",
 		CortexAddr: "127.0.0.1:8000",
-		Epoch:    5,
+		Epoch:      5,
 	}
 
 	clientConn, reqCh := mockCortexJoin(t, serverResp)
@@ -736,7 +856,9 @@ func TestJoinHandler_LegacyLobe_Accepted(t *testing.T) {
 		t.Errorf("member NodeID = %q, want legacy-lobe-1", members[0].NodeID)
 	}
 
-	// OnLobeJoined callback should have fired.
+	// OnLobeJoined is deferred — caller must fire it after JoinResponse
+	// (+ optional Snapshot) is written to the wire. See FireOnLobeJoined doc.
+	handler.FireOnLobeJoined("legacy-lobe-1")
 	if joinedInfo.NodeID != "legacy-lobe-1" {
 		t.Errorf("joinedInfo.NodeID = %q, want legacy-lobe-1", joinedInfo.NodeID)
 	}

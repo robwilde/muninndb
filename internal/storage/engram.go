@@ -29,7 +29,7 @@ func (ps *PebbleStore) GetEngram(ctx context.Context, wsPrefix [8]byte, id ULID)
 		return nil, fmt.Errorf("get engram: %w", err)
 	}
 	if val == nil {
-		return nil, fmt.Errorf("engram not found")
+		return nil, fmt.Errorf("engram %w", ErrNotFound)
 	}
 
 	// Decode
@@ -119,8 +119,13 @@ func (ps *PebbleStore) GetEngrams(ctx context.Context, wsPrefix [8]byte, ids []U
 	})
 	if err != nil {
 		// Fallback: individual GetEngram calls.
+		slog.Warn("storage: GetEngrams iterator open failed, falling back to individual reads", "err", err)
 		for _, u := range uncached {
-			eng, _ := ps.GetEngram(ctx, wsPrefix, u.id)
+			eng, engErr := ps.GetEngram(ctx, wsPrefix, u.id)
+			if engErr != nil {
+				slog.Warn("storage: GetEngrams fallback read failed", "id", u.id, "err", engErr)
+				continue
+			}
 			result[u.resultIdx] = eng
 		}
 		return result, nil
@@ -153,6 +158,10 @@ func (ps *PebbleStore) GetEngrams(ctx context.Context, wsPrefix [8]byte, ids []U
 func (ps *PebbleStore) GetMetadata(ctx context.Context, wsPrefix [8]byte, ids []ULID) ([]*EngramMeta, error) {
 	result := make([]*EngramMeta, len(ids))
 	for i, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		// Level 1: metadata-only cache (populated after first Pebble read).
 		if meta, ok := ps.metaCache.Get([16]byte(id)); ok {
 			result[i] = meta
@@ -230,7 +239,7 @@ func (ps *PebbleStore) UpdateMetadata(ctx context.Context, wsPrefix [8]byte, id 
 		return err
 	}
 	if len(oldMetas) == 0 || oldMetas[0] == nil {
-		return fmt.Errorf("engram not found")
+		return fmt.Errorf("engram %w", ErrNotFound)
 	}
 	oldState := oldMetas[0].State
 	var prevLastAccessMillis int64
@@ -245,7 +254,7 @@ func (ps *PebbleStore) UpdateMetadata(ctx context.Context, wsPrefix [8]byte, id 
 		return fmt.Errorf("get engram raw: %w", err)
 	}
 	if rawBytes == nil {
-		return fmt.Errorf("engram not found")
+		return fmt.Errorf("engram %w", ErrNotFound)
 	}
 
 	// Patch all mutable metadata fields in-place and recompute CRC32.
@@ -281,6 +290,7 @@ func (ps *PebbleStore) UpdateMetadata(ctx context.Context, wsPrefix [8]byte, id 
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
 	}
+	ps.replicateBatch(batch)
 
 	// Update LastAccess index (best effort — index inconsistency is non-fatal).
 	if !meta.LastAccess.IsZero() {
@@ -312,7 +322,7 @@ func (ps *PebbleStore) UpdateRelevance(ctx context.Context, wsPrefix [8]byte, id
 		return err
 	}
 	if len(metas) == 0 || metas[0] == nil {
-		return fmt.Errorf("engram not found")
+		return fmt.Errorf("engram %w", ErrNotFound)
 	}
 	oldRelevance := metas[0].Relevance
 
@@ -323,7 +333,7 @@ func (ps *PebbleStore) UpdateRelevance(ctx context.Context, wsPrefix [8]byte, id
 		return fmt.Errorf("get engram raw: %w", err)
 	}
 	if rawBytes == nil {
-		return fmt.Errorf("engram not found")
+		return fmt.Errorf("engram %w", ErrNotFound)
 	}
 
 	// Patch relevance/stability/updatedAt in-place and recompute CRC32.
@@ -354,6 +364,7 @@ func (ps *PebbleStore) UpdateRelevance(ctx context.Context, wsPrefix [8]byte, id
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
 	}
+	ps.replicateBatch(batch)
 
 	// Append provenance entry via persistent worker (best effort — drops if full).
 	ps.provWork.Submit(wsPrefix, id, provenance.ProvenanceEntry{
@@ -362,6 +373,49 @@ func (ps *PebbleStore) UpdateRelevance(ctx context.Context, wsPrefix [8]byte, id
 		AgentID:   "system:relevance-update",
 		Operation: "update-relevance",
 		Note:      "",
+	})
+
+	return nil
+}
+
+// UpdateTrust updates the trust label of an engram in-place using PatchTrust.
+// Invalidates the L1 and metadata caches. Appends a provenance entry.
+func (ps *PebbleStore) UpdateTrust(ctx context.Context, wsPrefix [8]byte, id ULID, trust TrustLevel) error {
+	engramKey := keys.EngramKey(wsPrefix, [16]byte(id))
+	rawBytes, err := Get(ps.db, engramKey)
+	if err != nil {
+		return fmt.Errorf("get engram raw: %w", err)
+	}
+	if rawBytes == nil {
+		return fmt.Errorf("engram %w", ErrNotFound)
+	}
+
+	if err := erf.PatchTrust(rawBytes, uint8(trust)); err != nil {
+		return fmt.Errorf("patch trust: %w", err)
+	}
+
+	batch := ps.db.NewBatch()
+	defer batch.Close()
+
+	batch.Set(engramKey, rawBytes, nil)
+	metaKey := keys.MetaKey(wsPrefix, [16]byte(id))
+	batch.Set(metaKey, erf.MetaKeySlice(rawBytes), nil)
+
+	// Invalidate L1 and metadata caches before commit — cached structs are stale.
+	ps.cache.Delete(wsPrefix, id)
+	ps.metaCache.Remove([16]byte(id))
+
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		return fmt.Errorf("commit batch: %w", err)
+	}
+	ps.replicateBatch(batch)
+
+	ps.provWork.Submit(wsPrefix, id, provenance.ProvenanceEntry{
+		Timestamp: time.Now(),
+		Source:    provenance.SourceHuman,
+		AgentID:   "system:set-trust",
+		Operation: "update-trust",
+		Note:      trust.String(),
 	})
 
 	return nil
@@ -379,7 +433,11 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 		batch.Delete(keys.EngramKey(wsPrefix, [16]byte(id)), nil)
 		batch.Delete(keys.MetaKey(wsPrefix, [16]byte(id)), nil)
 		ps.cache.Delete(wsPrefix, id)
-		return batch.Commit(pebble.NoSync)
+		if err := batch.Commit(pebble.NoSync); err != nil {
+			return err
+		}
+		ps.replicateBatch(batch)
+		return nil
 	}
 
 	batch := ps.db.NewBatch()
@@ -495,11 +553,51 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 		parentIter.Close()
 	}
 
+	// Entity graph cleanup: remove 0x20 forward links, 0x23 reverse links,
+	// and 0x21 relationship records sourced from this engram.
+	entityNames, err := ps.deleteEntityLinks(wsPrefix, [16]byte(id), batch)
+	if err != nil {
+		slog.Warn("storage: entity link cleanup failed on delete, links may be orphaned", "engram", id.String(), "err", err)
+	}
+
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("delete engram: %w", err)
 	}
+	ps.replicateBatch(batch)
 
 	ps.cache.Delete(wsPrefix, id)
+
+	// Decrement MentionCount on each entity that was linked to this engram.
+	// Done post-commit: if the process crashes here, counts will be slightly
+	// high (stale) but no links remain, so the worst case is an entity
+	// that isn't recognized as orphaned until the next decrement.
+	// DecrementEntityMentionCount automatically deletes the 0x1F record when
+	// the count reaches 0 and the 0x23 reverse index confirms no live links remain.
+	for _, name := range entityNames {
+		if err := ps.DecrementEntityMentionCount(ctx, name); err != nil {
+			slog.Warn("storage: failed to decrement entity mention count on delete", "entity", name, "engram", id.String(), "err", err)
+		}
+	}
+
+	// Decrement co-occurrence counts for every pair of entities that appeared
+	// in this engram. Deletes the 0x24 key when the pair count reaches 0.
+	// Capped at maxCoOccurrenceEntities to bound the O(n²) work on pathological
+	// engrams; entities beyond the cap have stale counts (minor, consistent with
+	// counts being best-effort across restarts).
+	const maxCoOccurrenceEntities = 50
+	coNames := entityNames
+	if len(coNames) > maxCoOccurrenceEntities {
+		slog.Warn("storage: engram has unusually many entities, co-occurrence cleanup capped",
+			"engram", id.String(), "entity_count", len(entityNames), "cap", maxCoOccurrenceEntities)
+		coNames = coNames[:maxCoOccurrenceEntities]
+	}
+	for i := 0; i < len(coNames); i++ {
+		for j := i + 1; j < len(coNames); j++ {
+			if err := ps.DecrementEntityCoOccurrence(ctx, wsPrefix, coNames[i], coNames[j]); err != nil {
+				slog.Warn("storage: failed to decrement co-occurrence on delete", "a", coNames[i], "b", coNames[j], "engram", id.String(), "err", err)
+			}
+		}
+	}
 
 	// Decrement vault count synchronously to avoid a race where callers
 	// observe a stale count after DeleteEngram returns.
@@ -562,9 +660,13 @@ func (ps *PebbleStore) SoftDelete(ctx context.Context, wsPrefix [8]byte, id ULID
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
 	}
+	ps.replicateBatch(batch)
 
 	// Update cache (vault-scoped) and invalidate the metadata-only cache
 	// so subsequent GetMetadata calls see the updated StateSoftDeleted state.
+	// Note: entity links (0x20/0x23/0x21) are intentionally preserved on soft
+	// delete so that Restore can return the engram with its entity associations
+	// intact. Entity cleanup only happens on hard delete (DeleteEngram).
 	ps.cache.Set(wsPrefix, id, eng)
 	ps.metaCache.Remove([16]byte(id))
 
@@ -615,6 +717,7 @@ func (ps *PebbleStore) UpdateTags(ctx context.Context, wsPrefix [8]byte, id ULID
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
 	}
+	ps.replicateBatch(batch)
 
 	return nil
 }
@@ -646,7 +749,7 @@ func (ps *PebbleStore) GetConfidence(ctx context.Context, wsPrefix [8]byte, id U
 		return 0.0, fmt.Errorf("get metadata: %w", err)
 	}
 	if val == nil {
-		return 0.0, fmt.Errorf("metadata not found")
+		return 0.0, fmt.Errorf("metadata %w", ErrNotFound)
 	}
 
 	// Decode metadata to extract confidence
@@ -694,6 +797,7 @@ func (ps *PebbleStore) UpdateConfidence(ctx context.Context, wsPrefix [8]byte, i
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
 	}
+	ps.replicateBatch(batch)
 
 	// Update cache (vault-scoped).
 	ps.cache.Set(wsPrefix, id, eng)
@@ -739,6 +843,7 @@ func toERFEngram(eng *Engram) *erf.Engram {
 		MemoryType:     uint8(eng.MemoryType),
 		TypeLabel:      eng.TypeLabel,
 		Classification: eng.Classification,
+		Trust:          uint8(eng.Trust),
 	}
 }
 
@@ -778,6 +883,7 @@ func fromERFEngram(e *erf.Engram) *Engram {
 		MemoryType:     MemoryType(e.MemoryType),
 		TypeLabel:      e.TypeLabel,
 		Classification: e.Classification,
+		Trust:          TrustLevel(e.Trust),
 	}
 }
 
@@ -823,6 +929,10 @@ func (ps *PebbleStore) ScanEngrams(ctx context.Context, ws [8]byte, fn func(*Eng
 	embedValid := embedIter.First()
 
 	for valid := iter.First(); valid; valid = iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		k := iter.Key()
 		if len(k) < 25 { // 1 prefix + 8 ws + 16 ULID minimum
 			continue

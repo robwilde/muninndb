@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/oklog/ulid/v2"
+	"github.com/scrypster/muninndb/internal/audit"
 	"github.com/scrypster/muninndb/internal/auth"
 	"github.com/scrypster/muninndb/internal/logging"
 	"github.com/scrypster/muninndb/internal/transport/rest"
@@ -33,6 +35,12 @@ type Server struct {
 	tlsConfig     *tls.Config // nil = plain TCP
 	corsOrigins   []string
 	ln            net.Listener
+	auditLog      *audit.Logger
+}
+
+// SetAuditLogger wires an audit logger into the UI server.
+func (s *Server) SetAuditLogger(l *audit.Logger) {
+	s.auditLog = l
 }
 
 // sseHub manages connected SSE clients.
@@ -122,6 +130,9 @@ func NewServer(webFS fs.FS, engine rest.EngineAPI, apiHandler http.Handler, auth
 		mux.HandleFunc("/events", s.handleSSE)
 	}
 	mux.Handle("/api/", apiHandler)
+	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/static/logo.jpg", http.StatusMovedPermanently)
+	})
 	mux.HandleFunc("/", s.handleSPA)
 
 	s.mux = mux
@@ -302,6 +313,17 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.authStore.ValidateAdmin(req.Username, req.Password); err != nil {
+		if s.auditLog != nil {
+			s.auditLog.Log(audit.AuditEvent{
+				Timestamp: time.Now().UTC(),
+				EventID:   ulid.Make().String(),
+				ActorType: "admin",
+				ActorID:   req.Username,
+				Action:    "auth.login_failed",
+				Result:    "denied",
+				ClientIP:  r.RemoteAddr,
+			})
+		}
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
@@ -319,11 +341,33 @@ func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		Secure:   s.tlsConfig != nil,
 		MaxAge:   86400,
 	})
+	if s.auditLog != nil {
+		s.auditLog.Log(audit.AuditEvent{
+			Timestamp: time.Now().UTC(),
+			EventID:   ulid.Make().String(),
+			ActorType: "admin",
+			ActorID:   req.Username,
+			Action:    "auth.login",
+			Result:    "ok",
+			ClientIP:  r.RemoteAddr,
+		})
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
+	if s.auditLog != nil {
+		s.auditLog.Log(audit.AuditEvent{
+			Timestamp: time.Now().UTC(),
+			EventID:   ulid.Make().String(),
+			ActorType: "admin",
+			ActorID:   "admin",
+			Action:    "auth.logout",
+			Result:    "ok",
+			ClientIP:  r.RemoteAddr,
+		})
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:   "muninn_session",
 		Value:  "",
@@ -350,8 +394,8 @@ type statsMsg struct {
 	Data interface{} `json:"data"`
 }
 
-// broadcaster polls engine.Stat every 5s and pushes stats_update to all SSE clients.
-// It also does count-diff to detect new engrams and push memory_added.
+// broadcaster polls engine.Stat every 5s and pushes stats_update + workers_update
+// to all SSE clients. It also does count-diff to detect new engrams and push memory_added.
 func (s *Server) broadcaster(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -388,6 +432,13 @@ func (s *Server) broadcastStats(ctx context.Context, prevCount *int64) {
 		return
 	}
 	s.hub.broadcast(data)
+
+	// Push worker stats on every tick so the dashboard card stays live.
+	ws := s.engine.WorkerStats()
+	workerData, err := json.Marshal(statsMsg{Type: "workers_update", Data: ws})
+	if err == nil {
+		s.hub.broadcast(workerData)
+	}
 
 	// Count-diff: push memory_added if new engrams appeared.
 	if *prevCount > 0 && resp.EngramCount > *prevCount {

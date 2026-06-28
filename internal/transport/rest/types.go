@@ -24,6 +24,7 @@ type ReadResponse = mbp.ReadResponse
 type ActivateRequest = mbp.ActivateRequest
 type ActivateResponse = mbp.ActivateResponse
 type ActivationItem = mbp.ActivationItem
+
 // LinkRequest is the REST-specific link request with proper JSON tags.
 // The mbp.LinkRequest only has msgpack tags which don't decode from JSON.
 type LinkRequest struct {
@@ -41,26 +42,26 @@ type StatResponse = mbp.StatResponse
 type ErrorCode = mbp.ErrorCode
 
 const (
-	ErrOK                   = mbp.ErrOK
-	ErrEngramNotFound       = mbp.ErrEngramNotFound
-	ErrVaultNotFound        = mbp.ErrVaultNotFound
-	ErrInvalidEngram        = mbp.ErrInvalidEngram
-	ErrIdempotencyViolation = mbp.ErrIdempotencyViolation
-	ErrInvalidAssociation   = mbp.ErrInvalidAssociation
-	ErrSubscriptionNotFound = mbp.ErrSubscriptionNotFound
-	ErrThresholdInvalid     = mbp.ErrThresholdInvalid
-	ErrHopDepthExceeded     = mbp.ErrHopDepthExceeded
-	ErrWeightsInvalid       = mbp.ErrWeightsInvalid
-	ErrAuthFailed           = mbp.ErrAuthFailed
-	ErrVaultForbidden       = mbp.ErrVaultForbidden
+	ErrOK                    = mbp.ErrOK
+	ErrEngramNotFound        = mbp.ErrEngramNotFound
+	ErrVaultNotFound         = mbp.ErrVaultNotFound
+	ErrInvalidEngram         = mbp.ErrInvalidEngram
+	ErrIdempotencyViolation  = mbp.ErrIdempotencyViolation
+	ErrInvalidAssociation    = mbp.ErrInvalidAssociation
+	ErrSubscriptionNotFound  = mbp.ErrSubscriptionNotFound
+	ErrThresholdInvalid      = mbp.ErrThresholdInvalid
+	ErrHopDepthExceeded      = mbp.ErrHopDepthExceeded
+	ErrWeightsInvalid        = mbp.ErrWeightsInvalid
+	ErrAuthFailed            = mbp.ErrAuthFailed
+	ErrVaultForbidden        = mbp.ErrVaultForbidden
 	ErrRateLimited           = mbp.ErrRateLimited
 	ErrMaxResultsExceeded    = mbp.ErrMaxResultsExceeded
 	ErrInvalidClusterRequest = mbp.ErrInvalidClusterRequest
 	ErrStorageError          = mbp.ErrStorageError
-	ErrIndexError           = mbp.ErrIndexError
-	ErrEnrichmentError      = mbp.ErrEnrichmentError
-	ErrShardUnavailable     = mbp.ErrShardUnavailable
-	ErrInternal             = mbp.ErrInternal
+	ErrIndexError            = mbp.ErrIndexError
+	ErrEnrichmentError       = mbp.ErrEnrichmentError
+	ErrShardUnavailable      = mbp.ErrShardUnavailable
+	ErrInternal              = mbp.ErrInternal
 )
 
 // EngineAPI is the interface the REST server requires from the engine.
@@ -79,6 +80,7 @@ type EngineAPI interface {
 	GetBatchEngramLinks(ctx context.Context, req *BatchGetEngramLinksRequest) (*BatchGetEngramLinksResponse, error)
 	ListVaults(ctx context.Context) ([]string, error)
 	GetSession(ctx context.Context, req *GetSessionRequest) (*GetSessionResponse, error)
+	GetActivityCounts(ctx context.Context, req *ActivityCountsRequest) (*ActivityCountsResponse, error)
 	WorkerStats() cognitive.EngineWorkerStats
 	// SubscribeWithDeliver registers a push subscription with a delivery function.
 	// Returns the subscription ID. The deliver func is called from a goroutine
@@ -137,6 +139,9 @@ type EngineAPI interface {
 	// ExportGraph builds the entity→relationship graph for the vault.
 	// If includeEngrams is true the entity types are enriched from the entity record table.
 	ExportGraph(ctx context.Context, vault string, includeEngrams bool) (*engine.ExportGraph, error)
+	// EmbedStats returns the current stats for the embed retroactive processor.
+	// Returns a zero-value RetroactiveStats when no embed processor is registered.
+	EmbedStats() plugin.RetroactiveStats
 }
 
 // ── Web UI types ─────────────────────────────────────────────────────────
@@ -234,6 +239,27 @@ type GetSessionResponse struct {
 	Limit   int           `json:"limit"`
 }
 
+// ActivityCountsRequest requests daily activity counts for a vault.
+// The Location of Since (which Until is expected to match) selects the timezone
+// used to bucket counts into calendar days; UTC-located times produce UTC-day
+// buckets.
+type ActivityCountsRequest struct {
+	Vault string    `json:"vault"`
+	Since time.Time `json:"since"`
+	Until time.Time `json:"until"`
+}
+
+// ActivityCountItem is a single day's engram count.
+type ActivityCountItem struct {
+	Date  string `json:"date"`
+	Count int64  `json:"count"`
+}
+
+// ActivityCountsResponse returns per-day engram creation counts.
+type ActivityCountsResponse struct {
+	Counts []ActivityCountItem `json:"counts"`
+}
+
 // EvolveResponse is returned by the evolve endpoint.
 type EvolveResponse struct {
 	ID string `json:"id"`
@@ -264,7 +290,8 @@ type DecideRequest struct {
 
 // DecideResponse is returned by the decide endpoint.
 type DecideResponse struct {
-	ID string `json:"id"`
+	ID       string   `json:"id"`
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // RestoreResponse is returned by the restore endpoint.
@@ -277,12 +304,12 @@ type RestoreResponse struct {
 
 // TraverseRequest is the body for POST /api/traverse.
 type TraverseRequest struct {
-	Vault           string   `json:"vault"`
-	StartID         string   `json:"start_id"`
-	MaxHops         int      `json:"max_hops,omitempty"`
-	MaxNodes        int      `json:"max_nodes,omitempty"`
-	RelTypes        []string `json:"rel_types,omitempty"`
-	FollowEntities  bool     `json:"follow_entities,omitempty"`
+	Vault          string   `json:"vault"`
+	StartID        string   `json:"start_id"`
+	MaxHops        int      `json:"max_hops,omitempty"`
+	MaxNodes       int      `json:"max_nodes,omitempty"`
+	RelTypes       []string `json:"rel_types,omitempty"`
+	FollowEntities bool     `json:"follow_entities,omitempty"`
 }
 
 // TraversalNode is a single node in a graph traversal result.

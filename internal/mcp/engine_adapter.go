@@ -62,19 +62,19 @@ func (a *mcpEngineAdapter) GetContradictions(ctx context.Context, vault string) 
 	}
 	return result, nil
 }
-func (a *mcpEngineAdapter) Evolve(ctx context.Context, vault, oldID, newContent, reason string) (*WriteResult, error) {
-	id, err := a.eng.Evolve(ctx, vault, oldID, newContent, reason)
+func (a *mcpEngineAdapter) Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string) (*WriteResult, error) {
+	id, err := a.eng.Evolve(ctx, vault, oldID, newContent, reason, embedding, concept)
 	if err != nil {
 		return nil, err
 	}
 	return &WriteResult{ID: id.String()}, nil
 }
 func (a *mcpEngineAdapter) Consolidate(ctx context.Context, vault string, ids []string, merged string) (*ConsolidateResult, error) {
-	newID, archived, warnings, err := a.eng.Consolidate(ctx, vault, ids, merged)
+	res, err := a.eng.Consolidate(ctx, vault, ids, merged)
 	if err != nil {
 		return nil, err
 	}
-	return &ConsolidateResult{ID: newID.String(), Archived: archived, Warnings: warnings}, nil
+	return &ConsolidateResult{ID: res.MergedID.String(), Archived: res.Archived, Warnings: res.Warnings}, nil
 }
 func (a *mcpEngineAdapter) Session(ctx context.Context, vault string, since time.Time) (*SessionSummary, error) {
 	res, err := a.eng.Session(ctx, vault, since)
@@ -92,11 +92,11 @@ func (a *mcpEngineAdapter) Session(ctx context.Context, vault string, since time
 	return summary, nil
 }
 func (a *mcpEngineAdapter) Decide(ctx context.Context, vault, decision, rationale string, alternatives, evidenceIDs []string) (*WriteResult, error) {
-	id, err := a.eng.Decide(ctx, vault, decision, rationale, alternatives, evidenceIDs)
+	res, err := a.eng.Decide(ctx, vault, decision, rationale, alternatives, evidenceIDs)
 	if err != nil {
 		return nil, err
 	}
-	return &WriteResult{ID: id.String()}, nil
+	return &WriteResult{ID: res.ID.String(), Warnings: res.Warnings}, nil
 }
 
 func (a *mcpEngineAdapter) Restore(ctx context.Context, vault, id string) (*RestoreResult, error) {
@@ -147,7 +147,7 @@ func (a *mcpEngineAdapter) Traverse(ctx context.Context, vault string, req *Trav
 }
 
 func (a *mcpEngineAdapter) Explain(ctx context.Context, vault string, req *ExplainRequest) (*ExplainResult, error) {
-	data, err := a.eng.Explain(ctx, vault, req.EngramID, req.Query)
+	data, err := a.eng.Explain(ctx, vault, req.EngramID, req.Query, req.Embedding)
 	if err != nil {
 		return nil, err
 	}
@@ -203,10 +203,7 @@ func (a *mcpEngineAdapter) RetryEnrich(ctx context.Context, vault, id string) (*
 		return nil, fmt.Errorf("retry enrich: parse id: %w", err)
 	}
 
-	// Get the vault prefix and fetch the engram
-	store := a.eng.Store()
-	wsPrefix := store.ResolveVaultPrefix(vault)
-	eng, err := store.GetEngram(ctx, wsPrefix, ulid)
+	eng, err := a.eng.GetEngram(ctx, vault, ulid)
 	if err != nil {
 		return nil, fmt.Errorf("retry enrich: get engram: %w", err)
 	}
@@ -304,11 +301,12 @@ func (a *mcpEngineAdapter) GetEnrichmentMode(ctx context.Context) string {
 
 func (a *mcpEngineAdapter) AddChild(ctx context.Context, vault, parentID string, child *AddChildRequest) (*AddChildResult, error) {
 	input := &engine.AddChildInput{
-		Concept: child.Concept,
-		Content: child.Content,
-		Type:    child.Type,
-		Tags:    child.Tags,
-		Ordinal: child.Ordinal,
+		Concept:   child.Concept,
+		Content:   child.Content,
+		Type:      child.Type,
+		Tags:      child.Tags,
+		Ordinal:   child.Ordinal,
+		Embedding: child.Embedding,
 	}
 	r, err := a.eng.AddChild(ctx, vault, parentID, input)
 	if err != nil {
@@ -322,15 +320,19 @@ func (a *mcpEngineAdapter) FindByEntity(ctx context.Context, vault, entityName s
 }
 
 func (a *mcpEngineAdapter) CheckIdempotency(ctx context.Context, opID string) (*storage.IdempotencyReceipt, error) {
-	return a.eng.Store().CheckIdempotency(ctx, opID)
+	return a.eng.CheckIdempotency(ctx, opID)
 }
 
 func (a *mcpEngineAdapter) WriteIdempotency(ctx context.Context, opID, engramID string) error {
-	return a.eng.Store().WriteIdempotency(ctx, opID, engramID)
+	return a.eng.WriteIdempotency(ctx, opID, engramID)
 }
 
-func (a *mcpEngineAdapter) SetEntityState(ctx context.Context, entityName, state, mergedInto string) error {
-	return a.eng.SetEntityState(ctx, entityName, state, mergedInto)
+func (a *mcpEngineAdapter) SetEntityState(ctx context.Context, entityName, state, mergedInto, entityType string) error {
+	return a.eng.SetEntityState(ctx, entityName, state, mergedInto, entityType)
+}
+
+func (a *mcpEngineAdapter) SetEntityStateBatch(ctx context.Context, ops []engine.EntityStateOp) []error {
+	return a.eng.SetEntityStateBatch(ctx, ops)
 }
 
 func (a *mcpEngineAdapter) ExportGraph(ctx context.Context, vault string, includeEngrams bool) (*engine.ExportGraph, error) {
@@ -412,6 +414,110 @@ func (a *mcpEngineAdapter) ReplayEnrichment(ctx context.Context, vault string, s
 	return a.eng.ReplayEnrichment(ctx, vault, stages, limit, dryRun)
 }
 
+func (a *mcpEngineAdapter) GetEnrichmentCandidates(ctx context.Context, vault string, stages []string, afterCursor string, limit int) (*EnrichmentCandidatesResult, error) {
+	// Parse the opaque cursor string to a storage.ULID.
+	// Empty string → zero ULID (start from beginning).
+	var afterID storage.ULID
+	if afterCursor != "" {
+		id, err := storage.ParseULID(afterCursor)
+		if err != nil {
+			return nil, fmt.Errorf("invalid cursor: %w", err)
+		}
+		afterID = id
+	}
+
+	candidates, stagesRequested, nextID, err := a.eng.GetEnrichmentCandidates(ctx, vault, stages, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	items := make([]EnrichmentCandidate, len(candidates))
+	for i, c := range candidates {
+		items[i] = EnrichmentCandidate{
+			ID:            c.ID.String(),
+			Concept:       c.Concept,
+			Content:       c.Content,
+			Summary:       c.Summary,
+			MemoryType:    c.MemoryType,
+			TypeLabel:     c.TypeLabel,
+			CreatedAt:     c.CreatedAt.UTC().Format(time.RFC3339Nano),
+			UpdatedAt:     c.UpdatedAt.UTC().Format(time.RFC3339Nano),
+			MissingStages: c.MissingStages,
+			DigestFlags: map[string]bool{
+				"entities":       c.DigestFlags&plugin.DigestEntities != 0,
+				"relationships":  c.DigestFlags&plugin.DigestRelationships != 0,
+				"classification": c.DigestFlags&plugin.DigestClassified != 0,
+				"summary":        c.DigestFlags&plugin.DigestSummarized != 0,
+			},
+		}
+	}
+
+	// Encode next cursor. Zero ULID means exhausted → empty string (omitempty hides it).
+	var nextCursor string
+	if nextID != (storage.ULID{}) {
+		nextCursor = nextID.String()
+	}
+
+	return &EnrichmentCandidatesResult{
+		Items:           items,
+		StagesRequested: stagesRequested,
+		Count:           len(items),
+		NextCursor:      nextCursor,
+	}, nil
+}
+
+func (a *mcpEngineAdapter) ApplyEnrichment(ctx context.Context, vault string, req *ApplyEnrichmentRequest) (*ApplyEnrichmentResult, error) {
+	if req == nil {
+		return nil, fmt.Errorf("apply enrichment: request is required")
+	}
+	expectedUpdatedAt, err := time.Parse(time.RFC3339Nano, req.ExpectedUpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("apply enrichment: parse expected_updated_at: %w", err)
+	}
+	engineReq := &engine.EnrichmentApplyRequest{
+		ID:                req.ID,
+		ExpectedUpdatedAt: expectedUpdatedAt,
+		Summary:           req.Summary,
+		MemoryType:        req.MemoryType,
+		TypeLabel:         req.TypeLabel,
+		StagesCompleted:   req.StagesCompleted,
+		Source:            req.Source,
+	}
+	engineReq.Entities = make([]engine.EnrichmentApplyEntity, len(req.Entities))
+	for i, entity := range req.Entities {
+		engineReq.Entities[i] = engine.EnrichmentApplyEntity{
+			Name:       entity.Name,
+			Type:       entity.Type,
+			Confidence: entity.Confidence,
+		}
+	}
+	engineReq.Relationships = make([]engine.EnrichmentApplyRelationship, len(req.Relationships))
+	for i, rel := range req.Relationships {
+		engineReq.Relationships[i] = engine.EnrichmentApplyRelationship{
+			FromEntity: rel.FromEntity,
+			ToEntity:   rel.ToEntity,
+			RelType:    rel.RelType,
+			Weight:     rel.Weight,
+		}
+	}
+	result, err := a.eng.ApplyEnrichment(ctx, vault, engineReq)
+	if err != nil {
+		return nil, err
+	}
+	return &ApplyEnrichmentResult{
+		ID:            result.ID.String(),
+		Status:        "applied",
+		AppliedStages: result.AppliedStages,
+		UpdatedAt:     result.UpdatedAt.UTC().Format(time.RFC3339Nano),
+		DigestFlags: map[string]bool{
+			"entities":       result.DigestFlags&plugin.DigestEntities != 0,
+			"relationships":  result.DigestFlags&plugin.DigestRelationships != 0,
+			"classification": result.DigestFlags&plugin.DigestClassified != 0,
+			"summary":        result.DigestFlags&plugin.DigestSummarized != 0,
+		},
+	}, nil
+}
+
 func (a *mcpEngineAdapter) RecordFeedback(ctx context.Context, vault, engramID string, useful bool) error {
 	return a.eng.RecordFeedback(ctx, vault, engramID, useful)
 }
@@ -484,6 +590,18 @@ func (a *mcpEngineAdapter) GetEntityAggregate(ctx context.Context, vault, entity
 		result.UpdatedAt = time.Unix(0, rec.UpdatedAt).UTC().Format(time.RFC3339)
 	}
 	return result, nil
+}
+
+func (a *mcpEngineAdapter) GetVaultEmbedDim(ctx context.Context, vault string) int {
+	return a.eng.GetVaultEmbedDim(ctx, vault)
+}
+
+func (a *mcpEngineAdapter) SetTrust(ctx context.Context, vault, id, trust string) error {
+	return a.eng.SetTrust(ctx, vault, id, trust)
+}
+
+func (a *mcpEngineAdapter) GetAnnotations(ctx context.Context, vault, id string) (*engine.AnnotationData, error) {
+	return a.eng.GetAnnotations(ctx, vault, id)
 }
 
 func (a *mcpEngineAdapter) ListEntities(ctx context.Context, vault string, limit int, state string) ([]EntitySummary, error) {

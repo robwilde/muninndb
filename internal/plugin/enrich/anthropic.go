@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/scrypster/muninndb/internal/plugin"
 )
 
 // AnthropicLLMProvider is an HTTP client for Anthropic's /v1/messages endpoint.
@@ -20,10 +22,10 @@ type AnthropicLLMProvider struct {
 
 // anthropicMessagesRequest is the request structure for Anthropic messages API.
 type anthropicMessagesRequest struct {
-	Model       string               `json:"model"`
-	MaxTokens   int                  `json:"max_tokens"`
-	System      string               `json:"system"`
-	Messages    []anthropicMessage   `json:"messages"`
+	Model     string             `json:"model"`
+	MaxTokens int                `json:"max_tokens"`
+	System    string             `json:"system"`
+	Messages  []anthropicMessage `json:"messages"`
 }
 
 // anthropicMessage is a message in the Anthropic messages API.
@@ -44,7 +46,8 @@ type anthropicMessagesResponse struct {
 func NewAnthropicLLMProvider() *AnthropicLLMProvider {
 	return &AnthropicLLMProvider{
 		client: &http.Client{
-			Timeout: 300 * time.Second,
+			Timeout:   300 * time.Second,
+			Transport: plugin.WrapTransport(nil),
 		},
 	}
 }

@@ -26,7 +26,7 @@ type EngineInterface interface {
 
 	// Higher-level cognitive operations (tools 1-11)
 	GetContradictions(ctx context.Context, vault string) ([]ContradictionPair, error)
-	Evolve(ctx context.Context, vault, oldID, newContent, reason string) (*WriteResult, error)
+	Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string) (*WriteResult, error)
 	Consolidate(ctx context.Context, vault string, ids []string, mergedContent string) (*ConsolidateResult, error)
 	Session(ctx context.Context, vault string, since time.Time) (*SessionSummary, error)
 	Decide(ctx context.Context, vault, decision, rationale string, alternatives, evidenceIDs []string) (*WriteResult, error)
@@ -97,9 +97,14 @@ type EngineInterface interface {
 	// WriteIdempotency stores an idempotency receipt (op_id → engramID).
 	WriteIdempotency(ctx context.Context, opID, engramID string) error
 
-	// SetEntityState sets the lifecycle state of a named entity.
+	// SetEntityState sets the lifecycle state of a named entity, and optionally
+	// corrects its type. entityType may be empty (preserves existing type).
 	// For state="merged", mergedInto must be the canonical entity name.
-	SetEntityState(ctx context.Context, entityName, state, mergedInto string) error
+	SetEntityState(ctx context.Context, entityName, state, mergedInto, entityType string) error
+
+	// SetEntityStateBatch applies multiple entity state updates sequentially.
+	// Returns one error per operation (nil = success). Partial success is preserved.
+	SetEntityStateBatch(ctx context.Context, ops []engine.EntityStateOp) []error
 
 	// GetEntityClusters returns entity pairs that frequently co-occur in the same engrams,
 	// sorted by count descending. Only pairs with count >= minCount are returned.
@@ -130,6 +135,15 @@ type EngineInterface interface {
 	// When dryRun=true, only counts engrams needing enrichment without writing.
 	ReplayEnrichment(ctx context.Context, vault string, stages []string, limit int, dryRun bool) (*engine.ReplayEnrichmentResult, error)
 
+	// GetEnrichmentCandidates returns active engrams missing one or more requested
+	// enrichment stages without invoking any enrichment plugin.
+	// afterCursor is an opaque string cursor from a previous call's next_cursor field.
+	// Pass "" to start from the beginning. Returns next_cursor="" when exhausted.
+	GetEnrichmentCandidates(ctx context.Context, vault string, stages []string, afterCursor string, limit int) (*EnrichmentCandidatesResult, error)
+
+	// ApplyEnrichment persists explicit externally generated enrichment output.
+	ApplyEnrichment(ctx context.Context, vault string, req *ApplyEnrichmentRequest) (*ApplyEnrichmentResult, error)
+
 	// GetProvenance returns the ordered audit log for an engram.
 	// Returns an empty slice (not error) if no entries exist.
 	GetProvenance(ctx context.Context, vault, id string) ([]ProvenanceEntry, error)
@@ -147,4 +161,18 @@ type EngineInterface interface {
 	// state filters by lifecycle state ("active", "deprecated", "merged", "resolved", "" = all).
 	// limit caps results (0 = default 50).
 	ListEntities(ctx context.Context, vault string, limit int, state string) ([]EntitySummary, error)
+
+	// GetVaultEmbedDim returns the embedding vector dimension currently in use by vault.
+	// Derived from the HNSW index — returns 0 if no embeddings have been stored yet
+	// (dimension not yet established; any client-provided dimension will be accepted).
+	GetVaultEmbedDim(ctx context.Context, vault string) int
+
+	// SetTrust sets the trust label of an engram.
+	// trust must be one of "verified", "inferred", "external", "untrusted".
+	SetTrust(ctx context.Context, vault, id, trust string) error
+
+	// GetAnnotations returns annotation metadata for a single engram.
+	// Used to populate muninn_recall annotation objects when annotate=true.
+	// Returns a non-nil *engine.AnnotationData (possibly with empty fields) on success.
+	GetAnnotations(ctx context.Context, vault, id string) (*engine.AnnotationData, error)
 }

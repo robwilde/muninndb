@@ -143,13 +143,13 @@ func TestClusterCoordinator_Role_ThreadSafe(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for j := 0; j < 50; j++ {
-			simulatePromotion(coord,1)
+			simulatePromotion(coord, 1)
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		for j := 0; j < 50; j++ {
-			coord.handleDemotion()
+			coord.handleDemotion(causeClaim)
 		}
 	}()
 
@@ -164,13 +164,13 @@ func TestClusterCoordinator_IsLeader(t *testing.T) {
 	}
 
 	// Simulate promotion
-	simulatePromotion(coord,1)
+	simulatePromotion(coord, 1)
 	if !coord.IsLeader() {
 		t.Error("expected IsLeader=true after promotion")
 	}
 
 	// Simulate demotion
-	coord.handleDemotion()
+	coord.handleDemotion(causeClaim)
 	if coord.IsLeader() {
 		t.Error("expected IsLeader=false after demotion")
 	}
@@ -413,13 +413,13 @@ func TestClusterCoordinator_ReplicationLag(t *testing.T) {
 	coord, _ := newTestCoordinator(t, "auto")
 
 	// As Cortex (primary), lag should be 0
-	simulatePromotion(coord,1)
+	simulatePromotion(coord, 1)
 	if lag := coord.ReplicationLag(); lag != 0 {
 		t.Errorf("expected lag=0 on Cortex, got %d", lag)
 	}
 
 	// As Lobe (replica), lag = currentSeq - lastApplied
-	coord.handleDemotion()
+	coord.handleDemotion(causeClaim)
 
 	// Append some entries to the log
 	coord.repLog.Append(OpSet, []byte("k1"), []byte("v1"))
@@ -465,7 +465,7 @@ func TestClusterCoordinator_OnBecameCortex_Callback(t *testing.T) {
 		callbackEpoch = epoch
 	}
 
-	simulatePromotion(coord,7)
+	simulatePromotion(coord, 7)
 
 	if !called {
 		t.Error("expected OnBecameCortex to be called")
@@ -478,15 +478,21 @@ func TestClusterCoordinator_OnBecameCortex_Callback(t *testing.T) {
 func TestClusterCoordinator_OnBecameLobe_Callback(t *testing.T) {
 	coord, _ := newTestCoordinator(t, "auto")
 
-	var called bool
+	called := make(chan struct{}, 1)
 	coord.OnBecameLobe = func() {
-		called = true
+		select {
+		case called <- struct{}{}:
+		default:
+		}
 	}
 
-	simulatePromotion(coord,1)
-	coord.handleDemotion()
+	simulatePromotion(coord, 1)
+	coord.handleDemotion(causeClaim)
 
-	if !called {
+	// OnBecameLobe fires asynchronously (it must not block the MSP tick goroutine).
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
 		t.Error("expected OnBecameLobe to be called")
 	}
 	if coord.Role() != RoleReplica {
@@ -501,8 +507,8 @@ func TestClusterCoordinator_NilCallbacksSafe(t *testing.T) {
 	coord.OnBecameCortex = nil
 	coord.OnBecameLobe = nil
 
-	simulatePromotion(coord,1)
-	coord.handleDemotion()
+	simulatePromotion(coord, 1)
+	coord.handleDemotion(causeClaim)
 }
 
 func TestClusterCoordinator_Accessors(t *testing.T) {
@@ -569,22 +575,28 @@ func TestClusterCoordinator_QuorumLoss_PreemptiveDemotion(t *testing.T) {
 	coord, _ := newTestCoordinator(t, "auto")
 
 	// Promote to Cortex
-	simulatePromotion(coord,1)
+	simulatePromotion(coord, 1)
 	if !coord.IsLeader() {
 		t.Fatal("expected to be leader after promotion")
 	}
 
-	// Register 2 voters (self + peer-1) so quorum=2, but peer-1 is SDOWN
+	// Register 2 voters (self + peer-1) so quorum=2.
 	coord.election.RegisterVoter(coord.cfg.NodeID)
 	coord.election.RegisterVoter("peer-1")
 	coord.msp.AddPeer("peer-1", "127.0.0.1:9020", RoleReplica)
+
+	// Establish a live quorum first (peer-1 alive) — pre-emptive demotion only
+	// applies once a live quorum has been held this term (#522 Step 3 hadQuorum gate).
+	coord.checkQuorumHealth()
+
+	// Now peer-1 goes SDOWN → quorum lost.
 	coord.msp.mu.Lock()
 	if p, ok := coord.msp.peers["peer-1"]; ok {
 		p.SDown = true
 	}
 	coord.msp.mu.Unlock()
 
-	// First call: sets quorumLostSince
+	// First call after loss: sets quorumLostSince
 	coord.checkQuorumHealth()
 	if coord.IsLeader() {
 		// Should still be leader — timeout hasn't elapsed
@@ -615,7 +627,7 @@ func TestClusterCoordinator_QuorumLoss_PreemptiveDemotion(t *testing.T) {
 func TestClusterCoordinator_QuorumRestored_ResetsTimer(t *testing.T) {
 	coord, _ := newTestCoordinator(t, "auto")
 
-	simulatePromotion(coord,1)
+	simulatePromotion(coord, 1)
 	coord.election.RegisterVoter(coord.cfg.NodeID)
 	// Only self as voter, so quorum=1, which is always met.
 
@@ -929,7 +941,7 @@ func TestGracefulFailover_Success(t *testing.T) {
 	coord, _ := newTestCoordinator(t, "primary")
 
 	// Promote to Cortex.
-	simulatePromotion(coord,1)
+	simulatePromotion(coord, 1)
 	coord.epochStore.ForceSet(1)
 
 	// Set up a target peer with a net.Pipe so Send works.
@@ -1003,7 +1015,7 @@ func TestGracefulFailover_Success(t *testing.T) {
 
 func TestGracefulFailover_ConvergenceTimeout(t *testing.T) {
 	coord, _ := newTestCoordinator(t, "primary")
-	simulatePromotion(coord,1)
+	simulatePromotion(coord, 1)
 	coord.epochStore.ForceSet(1)
 
 	// Add a target peer.
@@ -1041,7 +1053,7 @@ func TestGracefulFailover_ConvergenceTimeout(t *testing.T) {
 
 func TestGracefulFailover_AckTimeout(t *testing.T) {
 	coord, _ := newTestCoordinator(t, "primary")
-	simulatePromotion(coord,1)
+	simulatePromotion(coord, 1)
 	coord.epochStore.ForceSet(1)
 
 	// Set up target peer with a pipe that reads but never sends ACK.
@@ -1080,7 +1092,7 @@ func TestGracefulFailover_AckTimeout(t *testing.T) {
 
 func TestGracefulFailover_DrainRejectsWrites(t *testing.T) {
 	coord, _ := newTestCoordinator(t, "primary")
-	simulatePromotion(coord,1)
+	simulatePromotion(coord, 1)
 	coord.epochStore.ForceSet(1)
 
 	// Set up target peer (no pipe needed — we use AddPeer for a non-connected peer
@@ -1430,4 +1442,86 @@ func TestCoordinator_SetReconcileOnHeal(t *testing.T) {
 		t.Errorf("after SetReconcileOnHeal(true), reconcileOnHeal = %d, want 1", got)
 	}
 
+}
+
+// TestClusterCoordinator_HandleIncomingJoin_SnapshotFails_NoCallback covers the
+// snapshot branch of the deferred-callback contract: when StreamSnapshot fails,
+// HandleIncomingJoin must NOT fire OnLobeJoined. Firing it would start a
+// NetworkStreamer against a lobe that never received a complete snapshot,
+// streaming ReplEntry frames the lobe cannot apply. On failure the peer is
+// closed so the lobe reconnects and retries the snapshot from scratch.
+func TestClusterCoordinator_HandleIncomingJoin_SnapshotFails_NoCallback(t *testing.T) {
+	coord, db := newTestCoordinator(t, "primary")
+	if err := coord.epochStore.ForceSet(2); err != nil {
+		t.Fatalf("ForceSet: %v", err)
+	}
+	// Only the leader accepts joins (#533); mark this cortex as leader.
+	coord.roleMu.Lock()
+	coord.role = RolePrimary
+	coord.roleMu.Unlock()
+
+	// Upgrade the join handler to a DB-aware one so the JoinResponse signals
+	// NeedsSnapshot=true and HandleIncomingJoin takes the snapshot path.
+	coord.joinHandler = NewJoinHandlerWithDB(coord.cfg.NodeID, "", coord.epochStore, coord.repLog, db, coord.mgr)
+	joined := make(chan NodeInfo, 1)
+	coord.joinHandler.OnLobeJoined = func(info NodeInfo) { joined <- info }
+
+	// net.Pipe stands in for the inbound lobe conn. The lobe reads the
+	// JoinResponse frame, then drops the connection — so the snapshot stream
+	// write fails with a broken pipe.
+	cortexConn, lobeConn := net.Pipe()
+	t.Cleanup(func() { cortexConn.Close(); lobeConn.Close() })
+
+	lobeReadDone := make(chan struct{})
+	go func() {
+		defer close(lobeReadDone)
+		if _, err := mbp.ReadFrame(lobeConn); err != nil {
+			return
+		}
+		lobeConn.Close() // drop conn so the following snapshot write fails
+	}()
+
+	req := mbp.JoinRequest{
+		NodeID:          "lobe-snapfail",
+		Addr:            "127.0.0.1:9999",
+		ProtocolVersion: mbp.CurrentProtocolVersion,
+	}
+	payload, err := msgpack.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal JoinRequest: %v", err)
+	}
+
+	nodeID, _, err := coord.HandleIncomingJoin(cortexConn, payload)
+	if err != nil {
+		t.Fatalf("HandleIncomingJoin: %v", err)
+	}
+	if nodeID != "lobe-snapfail" {
+		t.Fatalf("nodeID = %q, want lobe-snapfail", nodeID)
+	}
+
+	<-lobeReadDone
+
+	// Wait for the snapshot goroutine to finish. IncrementSnapshotCount runs
+	// synchronously inside HandleIncomingJoin before the goroutine is spawned,
+	// and the goroutine decrements via defer — so SnapshotInProgress() flips
+	// back to false exactly when the (failed) snapshot attempt completes.
+	deadline := time.Now().Add(3 * time.Second)
+	for coord.SnapshotInProgress() {
+		if time.Now().After(deadline) {
+			t.Fatal("snapshot goroutine did not finish within 3s")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// StreamSnapshot failed → OnLobeJoined must not have fired.
+	select {
+	case info := <-joined:
+		t.Fatalf("OnLobeJoined fired for %q after StreamSnapshot failed — would start a streamer against an incompletely-snapshotted lobe", info.NodeID)
+	default:
+	}
+
+	// The peer should have been closed so the lobe can reconnect and retry.
+	if peer, ok := coord.mgr.GetPeer("lobe-snapfail"); ok && peer.IsConnected() {
+		t.Error("peer still connected after snapshot failure — expected it to be closed for lobe retry")
+	}
 }

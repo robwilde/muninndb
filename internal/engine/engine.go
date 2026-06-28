@@ -3,7 +3,9 @@ package engine
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"math"
 	"math/rand"
@@ -43,13 +45,13 @@ type CognitiveForwarder interface {
 
 // Engine is the cognitive database engine implementing mbp.EngineAPI.
 type Engine struct {
-	store            *storage.PebbleStore
-	authStore        *auth.Store // nil = use Plasticity defaults (e.g. in tests)
-	fts              *fts.Index
-	ftsWorker        *fts.Worker  // async FTS indexing — decoupled from write hot path
-	activation       *activation.ActivationEngine
-	triggers         *trigger.TriggerSystem
-	engramCount      atomic.Int64
+	store       *storage.PebbleStore
+	authStore   *auth.Store // nil = use Plasticity defaults (e.g. in tests)
+	fts         *fts.Index
+	ftsWorker   *fts.Worker // async FTS indexing — decoupled from write hot path
+	activation  *activation.ActivationEngine
+	triggers    *trigger.TriggerSystem
+	engramCount atomic.Int64
 	// ──────────────────────────────────────────────────────────────────
 	// Cognitive Worker Subsystem
 	// ──────────────────────────────────────────────────────────────────
@@ -106,26 +108,26 @@ type Engine struct {
 	// code (or server.go in standalone) is responsible for calling
 	// hebbianWorker.Stop(), etc. before the process exits.
 	// ──────────────────────────────────────────────────────────────────
-	cogMu              sync.RWMutex
-	hebbianWorker      *cognitive.HebbianWorker
-	contradictWorker   *cognitive.Worker[cognitive.ContradictItem]
-	confidenceWorker   *cognitive.Worker[cognitive.ConfidenceUpdate]
-	transitionWorker   *cognitive.TransitionWorker
+	cogMu            sync.RWMutex
+	hebbianWorker    *cognitive.HebbianWorker
+	contradictWorker *cognitive.Worker[cognitive.ContradictItem]
+	confidenceWorker *cognitive.Worker[cognitive.ConfidenceUpdate]
+	transitionWorker *cognitive.TransitionWorker
 	activity         *cognitive.ActivityTracker
-	embedder activation.Embedder // optional embedder for embedding-based brief scoring
+	embedder         activation.Embedder // optional embedder for embedding-based brief scoring
 	// Feature subsystems (all optional, nil-safe)
-	autoAssoc      *autoassoc.Worker    // write-time automatic tag-based associations
-	neighborWorker *autoassoc.NeighborWorker // semantic neighbor auto-linking
-	goalLinkWorker *autoassoc.GoalLinkWorker  // goal-aware semantic auto-linking
-	noveltyDet           *novelty.Detector // write-time near-duplicate detection
-	noveltyJobs          chan noveltyJob    // async novelty work queue
-	noveltyDone          chan struct{}      // signals novelty worker shutdown
-	pruneDone            chan struct{}      // signals prune worker shutdown
-	idempotencySweepDone chan struct{}      // signals idempotency sweep worker shutdown
-	archiveGCDone        chan struct{}      // signals archive GC worker shutdown
-	coherence   *coherence.Registry // per-vault incremental coherence counters
-	scoring     *scoring.Store      // per-vault learnable scoring weights
-	prov        *provenance.Store   // audit trail per-engram
+	autoAssoc            *autoassoc.Worker         // write-time automatic tag-based associations
+	neighborWorker       *autoassoc.NeighborWorker // semantic neighbor auto-linking
+	goalLinkWorker       *autoassoc.GoalLinkWorker // goal-aware semantic auto-linking
+	noveltyDet           *novelty.Detector         // write-time near-duplicate detection
+	noveltyJobs          chan noveltyJob           // async novelty work queue
+	noveltyDone          chan struct{}             // signals novelty worker shutdown
+	pruneDone            chan struct{}             // signals prune worker shutdown
+	idempotencySweepDone chan struct{}             // signals idempotency sweep worker shutdown
+	archiveGCDone        chan struct{}             // signals archive GC worker shutdown
+	coherence            *coherence.Registry       // per-vault incremental coherence counters
+	scoring              *scoring.Store            // per-vault learnable scoring weights
+	prov                 *provenance.Store         // audit trail per-engram
 
 	// Fix 5: coherence persistence lifecycle
 	coherenceFlushStop chan struct{}
@@ -153,6 +155,29 @@ type Engine struct {
 	// Set via SetEnrichPlugin after construction.
 	enrichPlugin plugin.EnrichPlugin
 
+	// replayEnrichTimeout, when positive, caps each per-engram LLM enrichment
+	// call during ReplayEnrichment. Decouples the per-request timeout from the
+	// MCP request context deadline. Set via SetReplayEnrichTimeout.
+	// Useful for Ollama cold-start scenarios (MUNINN_ENRICH_TIMEOUT env var).
+	replayEnrichTimeout time.Duration
+
+	// replayFailMu guards replayFailCounts for atomic read-modify-write.
+	// A plain mutex + map is used instead of sync.Map to avoid the TOCTOU
+	// race inherent in Load-then-Store on sync.Map.
+	replayFailMu sync.Mutex
+	// replayFailCounts tracks how many times each engram has consecutively
+	// failed enrichment during replay calls in this server session.
+	// After maxReplayFails failures, the engram is skipped by subsequent
+	// ReplayEnrichment calls. Keys are storage.ULID; values are int.
+	// Resets on server restart. Cleared per-engram by ResetReplayFailCount.
+	replayFailCounts map[storage.ULID]int
+
+	// mergeMu serialises concurrent MergeEntity calls that touch the same entities.
+	// Uses a dedicated stripe array separate from the storage-layer entity locks to
+	// avoid reentrancy deadlock (UpsertEntityRecord acquires storage stripes internally).
+	// See merge_guard.go for the full concurrency contract.
+	mergeMu mergeGuard
+
 	// noveltyJobsDropped counts novelty jobs silently dropped because the channel was full.
 	noveltyJobsDropped atomic.Int64
 
@@ -162,10 +187,10 @@ type Engine struct {
 	stopOnce sync.Once
 
 	// Vault lifecycle fields
-	vaultOpsMu   sync.Mutex     // guards name reservation in StartClone/StartMerge
-	jobManager   *vaultjob.Manager  // tracks async clone/merge jobs
-	stopCtx      context.Context    // cancelled on Stop() to signal goroutines
-	stopCancel   context.CancelFunc
+	vaultOpsMu sync.Mutex        // guards name reservation in StartClone/StartMerge
+	jobManager *vaultjob.Manager // tracks async clone/merge jobs
+	stopCtx    context.Context   // cancelled on Stop() to signal goroutines
+	stopCancel context.CancelFunc
 
 	// Goroutine lifecycle tracking — see spawnFireAndForget and spawnJob.
 	// Per-request fire-and-forget goroutines (Read, RecordAccess).
@@ -174,8 +199,16 @@ type Engine struct {
 	// Long-running vault job goroutines (clone, merge, reembed, import).
 	jobWG      sync.WaitGroup
 	jobStopped atomic.Bool
+	// Synchronous vault-operation entrypoints (clone/import/export setup, vault
+	// maintenance, graph export, pruning) can still touch Pebble before they hand
+	// work off to a tracked background goroutine, or without spawning one at all.
+	// Fence and drain them separately so Stop() does not return while one of
+	// these direct Pebble-touching paths is still racing DB teardown.
+	vaultOpMu      sync.RWMutex
+	vaultOpWG      sync.WaitGroup
+	vaultOpStopped atomic.Bool
 
-	hnswRegistry *hnsw.Registry     // per-vault HNSW indexes (shared with activation)
+	hnswRegistry *hnsw.Registry // per-vault HNSW indexes (shared with activation)
 
 	// vaultMu provides per-vault mutual exclusion for destructive vault operations
 	// (PruneVault, ReindexFTSVault, ClearVault). Maps string vault name → *sync.Mutex.
@@ -186,6 +219,22 @@ type Engine struct {
 	// database — it cannot grow faster than the corpus itself — so no eviction
 	// is needed.
 	childMu sync.Map
+
+	// contentHashLocks serialises the GetContentHash → WriteEngram → PutContentHash
+	// sequence per (vault, content-hash) stripe, preventing TOCTOU duplicates under
+	// concurrent REST writes. Uses contentHashStripes FNV-32a stripes for constant memory overhead.
+	contentHashLocks [contentHashStripes]sync.Mutex
+}
+
+const contentHashStripes = 256
+
+// contentHashLock returns the stripe mutex for the given (vault prefix, content hash) pair.
+// Uses FNV-32a to spread locks across contentHashStripes stripes.
+func (e *Engine) contentHashLock(wsPrefix [8]byte, hash [32]byte) *sync.Mutex {
+	h := fnv.New32a()
+	h.Write(wsPrefix[:])
+	h.Write(hash[:])
+	return &e.contentHashLocks[h.Sum32()%contentHashStripes]
 }
 
 // SetOnWrite registers a callback invoked after every successful Write.
@@ -199,6 +248,22 @@ func (e *Engine) SetOnWrite(fn func()) {
 // Must be called before the engine starts serving requests (not safe for concurrent use with Write/Activate/Read).
 func (e *Engine) SetLatencyTracker(t *latency.Tracker) {
 	e.latencyTracker = t
+}
+
+// ReevaluatePushOnEmbed re-evaluates push subscriptions for an engram whose
+// embedding just finished computing asynchronously (#512). It resolves the
+// engram's vault and forwards to the trigger system, which pushes the engram to
+// any subscription it now matches semantically but was not already delivered to
+// at write time. Wired to the embed retroactive processor's OnEmbed callback.
+func (e *Engine) ReevaluatePushOnEmbed(eng *storage.Engram, vec []float32) {
+	if e.triggers == nil || eng == nil || len(vec) == 0 {
+		return
+	}
+	ws, ok := e.store.FindVaultPrefix(eng.ID)
+	if !ok {
+		return
+	}
+	e.triggers.NotifyEmbed(wsVaultID(ws), eng, vec)
 }
 
 // SetRetroactiveProcessors registers background processors for observability.
@@ -216,6 +281,17 @@ func (e *Engine) GetProcessorStats() []plugin.RetroactiveStats {
 		}
 	}
 	return stats
+}
+
+// EmbedStats returns the current stats for the first embed retroactive processor.
+// Returns a zero-value RetroactiveStats when no embed processor is registered.
+func (e *Engine) EmbedStats() plugin.RetroactiveStats {
+	for _, p := range e.retroProcessors {
+		if p != nil && p.Mode() == "embed" {
+			return p.Stats()
+		}
+	}
+	return plugin.RetroactiveStats{}
 }
 
 // GetEnrichmentMode returns a human-readable string describing the active enrichment setup.
@@ -275,44 +351,35 @@ type noveltyJob struct {
 }
 
 // NewEngine creates a new Engine.
-func NewEngine(
-	store *storage.PebbleStore,
-	authStore *auth.Store,
-	ftsIdx *fts.Index,
-	act *activation.ActivationEngine,
-	trig *trigger.TriggerSystem,
-	hebbianWorker *cognitive.HebbianWorker,
-	contradictWorker *cognitive.Worker[cognitive.ContradictItem],
-	confidenceWorker *cognitive.Worker[cognitive.ConfidenceUpdate],
-	embedder activation.Embedder,
-	hnswRegistry *hnsw.Registry,
-) *Engine {
+func NewEngine(cfg EngineConfig) *Engine {
+	store := cfg.Store
 	stopCtx, stopCancel := context.WithCancel(context.Background())
 	e := &Engine{
 		store:            store,
-		authStore:        authStore,
-		fts:              ftsIdx,
-		activation:       act,
-		triggers:         trig,
-		hebbianWorker:    hebbianWorker,
-		contradictWorker: contradictWorker,
-		confidenceWorker: confidenceWorker,
+		authStore:        cfg.AuthStore,
+		fts:              cfg.FTSIndex,
+		activation:       cfg.ActivationEngine,
+		triggers:         cfg.TriggerSystem,
+		hebbianWorker:    cfg.HebbianWorker,
+		contradictWorker: cfg.ContradictWorker,
+		confidenceWorker: cfg.ConfidenceWorker,
 		activity:         cognitive.NewActivityTracker(),
-		embedder:         embedder,
-		autoAssoc:        autoassoc.New(stopCtx, store, ftsIdx),
-		neighborWorker:  autoassoc.NewNeighborWorker(stopCtx, store, hnswRegistry),
-		goalLinkWorker:  autoassoc.NewGoalLinkWorker(stopCtx, store, hnswRegistry),
+		embedder:         cfg.Embedder,
+		autoAssoc:        autoassoc.New(stopCtx, store, cfg.FTSIndex),
+		neighborWorker:   autoassoc.NewNeighborWorker(stopCtx, store, cfg.HNSWRegistry),
+		goalLinkWorker:   autoassoc.NewGoalLinkWorker(stopCtx, store, cfg.HNSWRegistry),
 		noveltyDet:       novelty.New(),
 		noveltyJobs:      make(chan noveltyJob, 256),
 		noveltyDone:      make(chan struct{}),
 		pruneDone:        make(chan struct{}),
 		coherence:        coherence.NewRegistry(),
-		scoring:          scoring.NewStore(store.GetDB()),
-		prov:             provenance.NewStore(store.GetDB()),
+		scoring:          store.ScoringStore(),
+		prov:             store.ProvenanceStore(),
 		stopCtx:          stopCtx,
 		stopCancel:       stopCancel,
-		hnswRegistry:     hnswRegistry,
+		hnswRegistry:     cfg.HNSWRegistry,
 		jobManager:       vaultjob.NewManager(),
+		replayFailCounts: make(map[storage.ULID]int),
 	}
 	// Start async novelty worker to decouple O(N) Jaccard scan from write hot path.
 	// engine:spawn-ok — tracked by noveltyDone channel, drained in Stop()
@@ -320,8 +387,8 @@ func NewEngine(
 	// Start async FTS worker to decouple indexing from the write hot path.
 	// The engram is already durable in Pebble before this worker runs —
 	// it only controls keyword search visibility (eventual, ~100ms lag).
-	if ftsIdx != nil {
-		e.ftsWorker = fts.NewWorker(ftsIdx)
+	if cfg.FTSIndex != nil {
+		e.ftsWorker = fts.NewWorker(cfg.FTSIndex)
 	}
 	// Seed in-memory counter from persistent storage so Stat() is accurate after restart.
 	if count, err := store.CountEngrams(context.Background()); err == nil {
@@ -437,6 +504,9 @@ func (e *Engine) Stop() {
 		// so goroutines see a cancelled context, and before wg.Wait() calls below.
 		e.fireAndForgetStopped.Store(true)
 		e.jobStopped.Store(true)
+		e.vaultOpMu.Lock()
+		e.vaultOpStopped.Store(true)
+		e.vaultOpMu.Unlock()
 
 		if e.autoAssoc != nil {
 			e.autoAssoc.Stop()
@@ -484,6 +554,17 @@ func (e *Engine) Stop() {
 			case <-time.After(5 * time.Second):
 				slog.Warn("engine: coherence flush worker did not exit within 5s")
 			}
+		}
+		// Drain synchronous vault-operation setup paths before waiting on jobWG or
+		// closing the job manager. These entrypoints can still create/fail jobs and
+		// touch Pebble while Stop() is in progress.
+		vaultOpDone := make(chan struct{})
+		// engine:spawn-ok — local inline drain helper; closes vaultOpDone after vaultOpWG drains
+		go func() { e.vaultOpWG.Wait(); close(vaultOpDone) }()
+		select {
+		case <-vaultOpDone:
+		case <-time.After(30 * time.Second):
+			slog.Warn("engine: vault operation setup paths did not drain within 30s")
 		}
 		// Drain job goroutines BEFORE closing the job manager. Job goroutines
 		// call jobManager.Fail() / jobManager.Complete() — closing the manager
@@ -543,9 +624,9 @@ func (e *Engine) Stop() {
 //
 // MUST be used instead of bare `go` for all per-request goroutines.
 func (e *Engine) spawnFireAndForget(fn func()) bool {
-	e.fireAndForgetWG.Add(1)            // Add FIRST — visible to wg.Wait() in Stop()
+	e.fireAndForgetWG.Add(1) // Add FIRST — visible to wg.Wait() in Stop()
 	if e.fireAndForgetStopped.Load() {
-		e.fireAndForgetWG.Done()         // Undo — engine is shutting down
+		e.fireAndForgetWG.Done() // Undo — engine is shutting down
 		return false
 	}
 	// engine:spawn-ok — tracked by fireAndForgetWG, drained in Stop() before store.Close()
@@ -562,9 +643,9 @@ func (e *Engine) spawnFireAndForget(fn func()) bool {
 //
 // MUST be used instead of bare `go` for all vault job goroutines.
 func (e *Engine) spawnJob(fn func()) bool {
-	e.jobWG.Add(1)                      // Add FIRST — visible to wg.Wait() in Stop()
+	e.jobWG.Add(1) // Add FIRST — visible to wg.Wait() in Stop()
 	if e.jobStopped.Load() {
-		e.jobWG.Done()                   // Undo — engine is shutting down
+		e.jobWG.Done() // Undo — engine is shutting down
 		return false
 	}
 	// engine:spawn-ok — tracked by jobWG, drained in Stop() before jobManager.Close()
@@ -573,6 +654,47 @@ func (e *Engine) spawnJob(fn func()) bool {
 		fn()
 	}()
 	return true
+}
+
+// beginVaultOp tracks synchronous vault-operation setup work that can still
+// touch Pebble before handing off to a tracked background job. Returns false if
+// the engine is shutting down and the caller should fail fast.
+func (e *Engine) beginVaultOp() bool {
+	e.vaultOpMu.RLock()
+	if e.vaultOpStopped.Load() || (e.stopCtx != nil && e.stopCtx.Err() != nil) {
+		e.vaultOpMu.RUnlock()
+		return false
+	}
+	e.vaultOpWG.Add(1)
+	e.vaultOpMu.RUnlock()
+	return true
+}
+
+func (e *Engine) endVaultOp() {
+	e.vaultOpWG.Done()
+}
+
+// vaultOpContext returns a context that is cancelled when either the caller's
+// context is done or the engine begins shutting down. Long-running synchronous
+// vault operations should use this so Stop() can actively interrupt them rather
+// than only waiting for the fixed vaultOpWG drain timeout.
+func (e *Engine) vaultOpContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		if e.stopCtx != nil {
+			return e.stopCtx, func() {}
+		}
+		return context.Background(), func() {}
+	}
+	if e.stopCtx == nil || ctx == e.stopCtx {
+		return ctx, func() {}
+	}
+
+	opCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(e.stopCtx, cancel)
+	return opCtx, func() {
+		stop()
+		cancel()
+	}
 }
 
 // SetCoordinator wires the Lobe's ClusterCoordinator so Activate() can forward
@@ -634,9 +756,41 @@ func (e *Engine) generateEmbeddingBrief(ctx context.Context, items []mbp.Activat
 	return nil
 }
 
-// Store returns the underlying PebbleStore, used by the MCP adapter for direct storage access.
+// Store returns the underlying PebbleStore.
+// Prefer the typed engine methods (GetEngram, UpdateTags, CheckIdempotency, WriteIdempotency)
+// over direct Store() access. Store() is retained for HNSW plugin wiring that
+// requires the raw store adapter.
 func (e *Engine) Store() *storage.PebbleStore {
 	return e.store
+}
+
+// GetEngram fetches a single engram by vault and ULID.
+func (e *Engine) GetEngram(ctx context.Context, vault string, id storage.ULID) (*storage.Engram, error) {
+	wsPrefix := e.store.ResolveVaultPrefix(vault)
+	return e.store.GetEngram(ctx, wsPrefix, id)
+}
+
+// GetVaultEmbedDim returns the embedding vector dimension currently in use by vault.
+// Derived from the HNSW index — returns 0 if no embeddings have been stored yet.
+func (e *Engine) GetVaultEmbedDim(_ context.Context, vault string) int {
+	ws := e.store.ResolveVaultPrefix(vault)
+	return e.hnswRegistry.VaultEmbedDim(ws)
+}
+
+// UpdateTags replaces the tags on an engram.
+func (e *Engine) UpdateTags(ctx context.Context, vault string, id storage.ULID, tags []string) error {
+	wsPrefix := e.store.ResolveVaultPrefix(vault)
+	return e.store.UpdateTags(ctx, wsPrefix, id, tags)
+}
+
+// CheckIdempotency looks up an op_id receipt. Returns nil, nil if not found.
+func (e *Engine) CheckIdempotency(ctx context.Context, opID string) (*storage.IdempotencyReceipt, error) {
+	return e.store.CheckIdempotency(ctx, opID)
+}
+
+// WriteIdempotency stores an idempotency receipt (op_id → engramID).
+func (e *Engine) WriteIdempotency(ctx context.Context, opID, engramID string) error {
+	return e.store.WriteIdempotency(ctx, opID, engramID)
 }
 
 // CountEmbedded returns the count of engrams that have had embeddings generated
@@ -692,12 +846,55 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 	wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
 	e.activity.Record(wsPrefix)
 
+	// ── Content-hash dedup: O(1) exact-duplicate check ──────────────
+	// Locked per (vault, content-hash) stripe to prevent TOCTOU duplicates under
+	// concurrent REST writes: two goroutines with identical content must not both
+	// pass GetContentHash before either calls PutContentHash.
+	// unlockContentHash is idempotent — safe to call from any return path and
+	// from defer, eliminating the risk of a lock leak on future code changes.
+	contentHash := storage.ContentHash(req.Content)
+	contentHashMu := e.contentHashLock(wsPrefix, contentHash)
+	contentHashMu.Lock()
+	var contentHashUnlocked bool
+	unlockContentHash := func() {
+		if !contentHashUnlocked {
+			contentHashUnlocked = true
+			contentHashMu.Unlock()
+		}
+	}
+	defer unlockContentHash()
+	if existingID, err := e.store.GetContentHash(ctx, wsPrefix, contentHash); err == nil && existingID != (storage.ULID{}) {
+		// A mapping exists — verify the engram is still live (not soft-deleted).
+		if existingEng, err := e.store.GetEngram(ctx, wsPrefix, existingID); err == nil && existingEng.State != storage.StateSoftDeleted {
+			// Reinforce: increment access count and update LastAccess
+			// to signal that this content is being re-experienced.
+			// Release the stripe lock before UpdateMetadata — the dedup decision
+			// is already made and UpdateMetadata doesn't need protection.
+			unlockContentHash()
+			_ = e.store.UpdateMetadata(ctx, wsPrefix, existingID, &storage.EngramMeta{
+				AccessCount: existingEng.AccessCount + 1,
+				LastAccess:  time.Now(),
+				State:       existingEng.State,
+				Confidence:  existingEng.Confidence,
+				Relevance:   existingEng.Relevance,
+				Stability:   existingEng.Stability,
+			})
+			return &mbp.WriteResponse{
+				ID:        existingID.String(),
+				CreatedAt: existingEng.CreatedAt.UnixNano(),
+				Hint:      "duplicate_content",
+			}, nil
+		}
+		// Engram was soft-deleted or not found — remove stale hash mapping and proceed.
+		_ = e.store.DeleteContentHash(ctx, wsPrefix, contentHash)
+	}
+
 	// Resolve inline enrichment mode for this vault.
 	vaultName := req.Vault
 	if vaultName == "" {
 		vaultName = "default"
 	}
-	resolved := e.resolveVaultPlasticity(vaultName)
+	resolved := e.ResolveVaultPlasticity(vaultName)
 	inlineMode := resolved.InlineEnrichment
 
 	// Determine which caller-provided enrichment fields to use based on mode.
@@ -726,6 +923,7 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 		Embedding:  req.Embedding,
 		MemoryType: storage.MemoryType(req.MemoryType),
 		TypeLabel:  req.TypeLabel,
+		Trust:      storage.TrustInferred, // all new MCP writes default to inferred
 	}
 
 	// Apply caller-provided summary directly to the engram.
@@ -733,8 +931,12 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 		eng.Summary = callerSummary
 	}
 
-	// Set custom CreatedAt if provided
+	// Set custom CreatedAt if provided; validate bounds to prevent provenance
+	// falsification and ULID overflow.
 	if req.CreatedAt != nil {
+		if err := validateCreatedAt(*req.CreatedAt); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
 		eng.CreatedAt = *req.CreatedAt
 	}
 
@@ -743,7 +945,7 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 	for i, a := range req.Associations {
 		targetID, err := storage.ParseULID(a.TargetID)
 		if err != nil {
-			return nil, fmt.Errorf("parse target id: %w", err)
+			return nil, fmt.Errorf("%w: association target_id %q: %v", ErrInvalidID, a.TargetID, err)
 		}
 		assocs[i] = storage.Association{
 			TargetID:      targetID,
@@ -762,14 +964,38 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 		return nil, fmt.Errorf("write engram: %w", err)
 	}
 
+	// Store content hash → engram ID mapping for future dedup lookups.
+	if err := e.store.PutContentHash(ctx, wsPrefix, contentHash, id); err != nil {
+		slog.Warn("engine: failed to store content hash", "id", id.String(), "err", err)
+	}
+	unlockContentHash() // release stripe lock — PutContentHash is done
+
+	// When the caller provided an embedding, mark DigestEmbed so the retroactive
+	// processor does not overwrite it, then insert into HNSW inline so the vector
+	// is searchable immediately (the retroactive processor skips DigestEmbed-flagged
+	// engrams and therefore never calls HNSWInsert for them).
+	if len(req.Embedding) > 0 {
+		existing, _ := e.store.GetDigestFlags(ctx, plugin.ULID(id))
+		if err := e.store.SetDigestFlag(ctx, id, existing|plugin.DigestEmbed); err != nil {
+			slog.Warn("engine: failed to set DigestEmbed flag", "id", id.String(), "err", err)
+		}
+		if err := e.hnswRegistry.Insert(ctx, wsPrefix, [16]byte(id), req.Embedding); err != nil {
+			slog.Warn("engine: failed to insert client embedding into HNSW", "id", id.String(), "err", err)
+		}
+	}
+
 	// Store caller-provided inline entities in the entity table (not as KeyPoints).
 	if len(callerEntities) > 0 {
 		ws, _ := e.store.FindVaultPrefix(id)
 		var linkedEntityNames []string
 		for _, ent := range callerEntities {
+			typ := strings.ToLower(strings.TrimSpace(ent.Type))
+			if typ == "" {
+				typ = "other"
+			}
 			record := storage.EntityRecord{
 				Name:       ent.Name,
-				Type:       ent.Type,
+				Type:       typ,
 				Confidence: 1.0,
 			}
 			if err := e.store.UpsertEntityRecord(ctx, record, "inline"); err != nil {
@@ -824,6 +1050,7 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 	}
 
 	// Store caller-provided entity-to-entity relationships in the 0x21 relationship index.
+	wroteEntityRelationships := false
 	if len(req.EntityRelationships) > 0 {
 		wsER, _ := e.store.FindVaultPrefix(id)
 		for _, er := range req.EntityRelationships {
@@ -842,7 +1069,34 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 				Source:     "inline",
 			}); err != nil {
 				slog.Warn("engine: failed to store entity relationship", "vault", req.Vault, "engram", id.String(), "from", er.FromEntity, "to", er.ToEntity, "rel_type", er.RelType, "err", err)
+				continue
 			}
+			wroteEntityRelationships = true
+		}
+	}
+
+	// Mark per-stage digest flags for inline (caller-supplied) enrichment so
+	// GetEnrichmentCandidates does not report these memories as un-enriched (#500).
+	// Mirror the existing DigestEntities-on-inline pattern: only set a stage's flag
+	// when that stage's data is actually present from the caller.
+	//   - summary supplied        -> DigestSummarized
+	//   - entity relationships     -> DigestRelationships
+	//   - type/classification      -> DigestClassified (req.TypeLabel is set whenever
+	//                                 the caller supplies a type or type_label)
+	var inlineStageFlags uint8
+	if callerSummary != "" {
+		inlineStageFlags |= plugin.DigestSummarized
+	}
+	if wroteEntityRelationships {
+		inlineStageFlags |= plugin.DigestRelationships
+	}
+	if req.TypeLabel != "" {
+		inlineStageFlags |= plugin.DigestClassified
+	}
+	if inlineStageFlags != 0 {
+		existing, _ := e.store.GetDigestFlags(ctx, plugin.ULID(id))
+		if flagErr := e.store.SetDigestFlag(ctx, id, existing|inlineStageFlags); flagErr != nil {
+			slog.Warn("engine: failed to set inline enrichment stage flags", "id", id.String(), "flags", inlineStageFlags, "error", flagErr)
 		}
 	}
 
@@ -956,7 +1210,6 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 		})
 	}
 
-
 	// Write-time semantic neighbor linking: find semantically similar engrams via HNSW.
 	if e.neighborWorker != nil && len(eng.Embedding) > 0 {
 		e.neighborWorker.EnqueueNeighborJob(autoassoc.NeighborJob{
@@ -1020,15 +1273,16 @@ var ErrBatchTooLarge = fmt.Errorf("batch size exceeds maximum of %d", MaxBatchSi
 // the prepared engram plus post-commit metadata. This avoids re-deriving
 // vault prefixes and enrichment fields after the batch commits.
 type preparedBatchItem struct {
-	wsPrefix                [8]byte
-	vaultName               string
-	eng                     *storage.Engram
-	inlineMode              string
-	callerSummary           string
-	callerEntities          []mbp.InlineEntity
-	callerRelationships     []mbp.InlineRelationship
+	wsPrefix                  [8]byte
+	vaultName                 string
+	eng                       *storage.Engram
+	inlineMode                string
+	callerSummary             string
+	callerEntities            []mbp.InlineEntity
+	callerRelationships       []mbp.InlineRelationship
 	callerEntityRelationships []mbp.InlineEntityRelationship
-	skipBackgroundEnrich    bool
+	skipBackgroundEnrich      bool
+	contentHash               [32]byte // SHA-256 of content for dedup
 }
 
 // WriteBatch writes multiple engrams in a single Pebble batch commit, then
@@ -1056,11 +1310,37 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 		wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
 		e.activity.Record(wsPrefix)
 
+		// ── Content-hash dedup: same O(1) check as single Write ──────
+		// NOTE: Intra-batch dedup is not performed — items within the same batch
+		// cannot see each other's hashes during Phase 1. This is a known limitation.
+		contentHash := storage.ContentHash(req.Content)
+		if existingID, err := e.store.GetContentHash(ctx, wsPrefix, contentHash); err == nil && existingID != (storage.ULID{}) {
+			if existingEng, err := e.store.GetEngram(ctx, wsPrefix, existingID); err == nil && existingEng.State != storage.StateSoftDeleted {
+				// Reinforce: increment access count and update LastAccess.
+				_ = e.store.UpdateMetadata(ctx, wsPrefix, existingID, &storage.EngramMeta{
+					AccessCount: existingEng.AccessCount + 1,
+					LastAccess:  time.Now(),
+					State:       existingEng.State,
+					Confidence:  existingEng.Confidence,
+					Relevance:   existingEng.Relevance,
+					Stability:   existingEng.Stability,
+				})
+				responses[i] = &mbp.WriteResponse{
+					ID:        existingID.String(),
+					CreatedAt: existingEng.CreatedAt.UnixNano(),
+					Hint:      "duplicate_content",
+				}
+				continue
+			}
+			// Engram was soft-deleted or not found — remove stale hash mapping and proceed.
+			_ = e.store.DeleteContentHash(ctx, wsPrefix, contentHash)
+		}
+
 		vaultName := req.Vault
 		if vaultName == "" {
 			vaultName = "default"
 		}
-		resolved := e.resolveVaultPlasticity(vaultName)
+		resolved := e.ResolveVaultPlasticity(vaultName)
 		inlineMode := resolved.InlineEnrichment
 
 		var callerSummary string
@@ -1087,12 +1367,17 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 			Embedding:  req.Embedding,
 			MemoryType: storage.MemoryType(req.MemoryType),
 			TypeLabel:  req.TypeLabel,
+			Trust:      storage.TrustInferred, // all new MCP writes default to inferred
 		}
 
 		if callerSummary != "" {
 			eng.Summary = callerSummary
 		}
 		if req.CreatedAt != nil {
+			if validateErr := validateCreatedAt(*req.CreatedAt); validateErr != nil {
+				errs[i] = fmt.Errorf("%w: %v", ErrInvalidRequest, validateErr)
+				continue
+			}
 			eng.CreatedAt = *req.CreatedAt
 		}
 
@@ -1131,29 +1416,48 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 			callerRelationships:       callerRelationships,
 			callerEntityRelationships: req.EntityRelationships,
 			skipBackgroundEnrich:      skipBG,
+			contentHash:               contentHash,
 		}
 		validCount++
 	}
 
-	// Phase 2: Single Pebble batch commit for all valid engrams.
-	ids, batchErrs := e.store.WriteEngramBatch(ctx, items)
+	// Phase 2: Single Pebble batch commit for all valid (non-dedup'd) engrams.
+	// Build a filtered items slice excluding dedup'd and errored items so
+	// WriteEngramBatch never sees nil Engram pointers.
+	filteredItems := make([]storage.EngramBatchItem, 0, validCount)
+	filteredIdx := make([]int, 0, validCount) // maps filtered position → original index
 	for i := range reqs {
-		if errs[i] != nil {
-			continue // already failed in prepare phase
+		if responses[i] != nil || errs[i] != nil {
+			continue // dedup'd or errored in Phase 1
 		}
-		if batchErrs[i] != nil {
-			errs[i] = fmt.Errorf("write engram: %w", batchErrs[i])
+		filteredIdx = append(filteredIdx, i)
+		filteredItems = append(filteredItems, items[i])
+	}
+	batchIDs, batchErrs := e.store.WriteEngramBatch(ctx, filteredItems)
+	ids := make([]storage.ULID, n)
+	for fi, origIdx := range filteredIdx {
+		if batchErrs[fi] != nil {
+			errs[origIdx] = fmt.Errorf("write engram: %w", batchErrs[fi])
 			continue
 		}
-		responses[i] = &mbp.WriteResponse{
-			ID:        ids[i].String(),
+		ids[origIdx] = batchIDs[fi]
+		responses[origIdx] = &mbp.WriteResponse{
+			ID:        batchIDs[fi].String(),
 			CreatedAt: time.Now().UnixNano(),
+		}
+		// Store content hash → engram ID mapping for future dedup lookups.
+		if err := e.store.PutContentHash(ctx, prepared[origIdx].wsPrefix, prepared[origIdx].contentHash, batchIDs[fi]); err != nil {
+			slog.Warn("engine: batch: failed to store content hash", "id", batchIDs[fi].String(), "err", err)
 		}
 	}
 
 	// Phase 3: Post-commit async work for each successfully written engram.
 	for i := range reqs {
-		if errs[i] != nil {
+		if errs[i] != nil || responses[i] == nil {
+			continue
+		}
+		// Skip dedup'd items (they have no new engram to process).
+		if responses[i].Hint == "duplicate_content" {
 			continue
 		}
 		p := &prepared[i]
@@ -1164,9 +1468,13 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 			ws, _ := e.store.FindVaultPrefix(id)
 			var linkedEntityNames []string
 			for _, ent := range p.callerEntities {
+				typ := strings.ToLower(strings.TrimSpace(ent.Type))
+				if typ == "" {
+					typ = "other"
+				}
 				record := storage.EntityRecord{
 					Name:       ent.Name,
-					Type:       ent.Type,
+					Type:       typ,
 					Confidence: 1.0,
 				}
 				if err := e.store.UpsertEntityRecord(ctx, record, "inline"); err != nil {
@@ -1220,6 +1528,7 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 		}
 
 		// Store caller-provided entity-to-entity relationships in the 0x21 relationship index.
+		wroteEntityRelationships := false
 		if len(p.callerEntityRelationships) > 0 {
 			wsER, ok := e.store.FindVaultPrefix(id)
 			if !ok {
@@ -1241,8 +1550,44 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 						Source:     "inline",
 					}); err != nil {
 						slog.Warn("engine: batch: failed to store entity relationship", "vault", p.vaultName, "engram", id.String(), "from", er.FromEntity, "to", er.ToEntity, "rel_type", er.RelType, "err", err)
+						continue
 					}
+					wroteEntityRelationships = true
 				}
+			}
+		}
+
+		// Mark per-stage digest flags for inline (caller-supplied) enrichment so
+		// GetEnrichmentCandidates does not report these memories as un-enriched (#500).
+		// Mirror the single-write path: only set a stage's flag when that stage's data
+		// is actually present from the caller.
+		var inlineStageFlags uint8
+		if p.callerSummary != "" {
+			inlineStageFlags |= plugin.DigestSummarized
+		}
+		if wroteEntityRelationships {
+			inlineStageFlags |= plugin.DigestRelationships
+		}
+		if p.eng.TypeLabel != "" {
+			inlineStageFlags |= plugin.DigestClassified
+		}
+		if inlineStageFlags != 0 {
+			existing, _ := e.store.GetDigestFlags(ctx, plugin.ULID(id))
+			if flagErr := e.store.SetDigestFlag(ctx, id, existing|inlineStageFlags); flagErr != nil {
+				slog.Warn("engine: batch: failed to set inline enrichment stage flags", "id", id.String(), "flags", inlineStageFlags, "error", flagErr)
+			}
+		}
+
+		// When the caller provided an embedding, mark DigestEmbed so the retroactive
+		// processor does not overwrite it, then insert into HNSW inline so the vector
+		// is searchable immediately.
+		if len(reqs[i].Embedding) > 0 {
+			existing, _ := e.store.GetDigestFlags(ctx, plugin.ULID(id))
+			if err := e.store.SetDigestFlag(ctx, id, existing|plugin.DigestEmbed); err != nil {
+				slog.Warn("engine: batch: failed to set DigestEmbed flag", "id", id.String(), "err", err)
+			}
+			if err := e.hnswRegistry.Insert(ctx, p.wsPrefix, [16]byte(id), reqs[i].Embedding); err != nil {
+				slog.Warn("engine: batch: failed to insert client embedding into HNSW", "id", id.String(), "err", err)
 			}
 		}
 
@@ -1380,6 +1725,9 @@ func (e *Engine) Read(ctx context.Context, req *mbp.ReadRequest) (*mbp.ReadRespo
 
 	eng, err := e.store.GetEngram(ctx, wsPrefix, id)
 	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, ErrEngramNotFound
+		}
 		return nil, fmt.Errorf("get engram: %w", err)
 	}
 
@@ -1395,6 +1743,35 @@ func (e *Engine) Read(ctx context.Context, req *mbp.ReadRequest) (*mbp.ReadRespo
 		e.scoring.RecordFeedback(e.stopCtx, wsPrefix, signal)
 	})
 
+	// Collect entities linked to this engram (0x20 forward index).
+	var entities []mbp.InlineEntity
+	_ = e.store.ScanEngramEntities(ctx, wsPrefix, id, func(name string) error {
+		rec, err := e.store.GetEntityRecord(ctx, name)
+		if err != nil || rec == nil {
+			entities = append(entities, mbp.InlineEntity{Name: name})
+			return nil
+		}
+		entities = append(entities, mbp.InlineEntity{Name: rec.Name, Type: rec.Type})
+		return nil
+	})
+
+	// Collect entity-to-entity relationships sourced from this engram (0x21 prefix).
+	// co_occurs_with records are engine-generated side effects (not caller-provided) and
+	// are excluded — use muninn_entity to explore co-occurrence data.
+	var entityRels []mbp.InlineEntityRelationship
+	_ = e.store.ScanEngramRelationships(ctx, wsPrefix, id, func(r storage.RelationshipRecord) error {
+		if r.RelType == "co_occurs_with" {
+			return nil
+		}
+		entityRels = append(entityRels, mbp.InlineEntityRelationship{
+			FromEntity: r.FromEntity,
+			ToEntity:   r.ToEntity,
+			RelType:    r.RelType,
+			Weight:     r.Weight,
+		})
+		return nil
+	})
+
 	d := time.Since(readStart)
 	if e.latencyTracker != nil {
 		e.latencyTracker.Record(wsPrefix, "read", d)
@@ -1402,24 +1779,27 @@ func (e *Engine) Read(ctx context.Context, req *mbp.ReadRequest) (*mbp.ReadRespo
 	metrics.ReadDuration.WithLabelValues(req.Vault).Observe(d.Seconds())
 
 	return &mbp.ReadResponse{
-		ID:             eng.ID.String(),
-		Concept:        eng.Concept,
-		Content:        eng.Content,
-		Confidence:     eng.Confidence,
-		Relevance:      eng.Relevance,
-		Stability:      eng.Stability,
-		AccessCount:    eng.AccessCount,
-		Tags:           eng.Tags,
-		State:          uint8(eng.State),
-		CreatedAt:      eng.CreatedAt.UnixNano(),
-		UpdatedAt:      eng.UpdatedAt.UnixNano(),
-		LastAccess:     eng.LastAccess.UnixNano(),
-		Summary:        eng.Summary,
-		KeyPoints:      eng.KeyPoints,
-		MemoryType:     uint8(eng.MemoryType),
-		TypeLabel:      eng.TypeLabel,
-		Classification: eng.Classification,
-		EmbedDim:       uint8(eng.EmbedDim),
+		ID:                  eng.ID.String(),
+		Concept:             eng.Concept,
+		Content:             eng.Content,
+		Confidence:          eng.Confidence,
+		Relevance:           eng.Relevance,
+		Stability:           eng.Stability,
+		AccessCount:         eng.AccessCount,
+		Tags:                eng.Tags,
+		State:               uint8(eng.State),
+		CreatedAt:           eng.CreatedAt.UnixNano(),
+		UpdatedAt:           eng.UpdatedAt.UnixNano(),
+		LastAccess:          eng.LastAccess.UnixNano(),
+		Summary:             eng.Summary,
+		KeyPoints:           eng.KeyPoints,
+		MemoryType:          uint8(eng.MemoryType),
+		TypeLabel:           eng.TypeLabel,
+		Classification:      eng.Classification,
+		EmbedDim:            uint8(eng.EmbedDim),
+		Trust:               uint8(eng.Trust),
+		Entities:            entities,
+		EntityRelationships: entityRels,
 	}, nil
 }
 
@@ -1428,16 +1808,15 @@ func (e *Engine) Activate(ctx context.Context, req *mbp.ActivateRequest) (*mbp.A
 	return e.activateCore(ctx, req, nil)
 }
 
-// ActivateWithStructuredFilter is like Activate but accepts a structured filter
-// (e.g., *query.Filter) that implements a Match(*storage.Engram) bool interface.
-// This allows the MQL executor to pass WHERE predicates for proper post-retrieval filtering.
-func (e *Engine) ActivateWithStructuredFilter(ctx context.Context, req *mbp.ActivateRequest, structuredFilter interface{}) (*mbp.ActivateResponse, error) {
+// ActivateWithStructuredFilter is like Activate but accepts a typed filter for
+// post-retrieval predicate evaluation (e.g., *query.Filter from MQL WHERE clauses).
+func (e *Engine) ActivateWithStructuredFilter(ctx context.Context, req *mbp.ActivateRequest, structuredFilter activation.EngramFilter) (*mbp.ActivateResponse, error) {
 	return e.activateCore(ctx, req, structuredFilter)
 }
 
 // activateCore is the shared implementation for Activate and ActivateWithStructuredFilter.
-// structuredFilter may be nil (plain Activate) or a non-nil filter value (structured query).
-func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, structuredFilter interface{}) (*mbp.ActivateResponse, error) {
+// structuredFilter may be nil (plain Activate) or a typed predicate (structured query).
+func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, structuredFilter activation.EngramFilter) (*mbp.ActivateResponse, error) {
 	// Pin a Pebble snapshot so all read phases see a consistent point-in-time view.
 	snap := e.store.NewSnapshot()
 	defer snap.Close()
@@ -1482,6 +1861,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	// PAS: Predictive Activation Signal config from vault Plasticity.
 	actReq.PASEnabled = resolved.PredictiveActivation
 	actReq.PASMaxInjections = resolved.PASMaxInjections
+	actReq.ExcludeUntrusted = resolved.ExcludeUntrusted
 
 	// Set defaults
 	if actReq.MaxResults == 0 {
@@ -1548,6 +1928,16 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 			UseACTR:      true,
 			ACTRDecay:    actrDecay,
 			ACTRHebScale: actrHebScale,
+		}
+
+		// Wire ScoringFusion from plasticity config to activation weights.
+		if resolved.ScoringFusion == "rrf" {
+			actReq.Weights.UseRRFFusion = true
+			actReq.Weights.DisableACTR = true
+			actReq.Weights.UseACTR = false
+		} else if resolved.ScoringFusion == "weighted_sum" {
+			actReq.Weights.DisableACTR = true
+			actReq.Weights.UseACTR = false
 		}
 	}
 
@@ -1646,6 +2036,8 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 			LastAccess:  scored.Engram.LastAccess.UnixNano(),
 			AccessCount: scored.Engram.AccessCount,
 			Relevance:   scored.Engram.Relevance,
+			State:       uint8(scored.Engram.State),
+			Trust:       uint8(scored.Engram.Trust),
 		}
 
 		items[i].ScoreComponents = mbp.ScoreComponents{
@@ -1704,10 +2096,19 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 					Score: scored.Score,
 				}
 			}
+			// Build per-vault LTP config from resolved plasticity.
+			var ltpCfg *cognitive.LTPConfig
+			if resolved.LTPThreshold > 0 {
+				ltpCfg = &cognitive.LTPConfig{
+					Threshold:   resolved.LTPThreshold,
+					WeightFloor: resolved.LTPWeightFloor,
+				}
+			}
 			hebW.Submit(cognitive.CoActivationEvent{
 				WS:      wsPrefix,
 				At:      time.Now(),
 				Engrams: coActivatedEngrams,
+				LTP:     ltpCfg,
 			})
 		} else if e.coordinator != nil {
 			lobeCoActivations = make([]mbp.CoActivationRef, len(result.Activations))
@@ -1876,12 +2277,12 @@ func (e *Engine) Link(ctx context.Context, req *mbp.LinkRequest) (*mbp.LinkRespo
 
 	sourceID, err := storage.ParseULID(req.SourceID)
 	if err != nil {
-		return nil, fmt.Errorf("parse source id: %w", err)
+		return nil, fmt.Errorf("%w: source_id %q: %v", ErrInvalidID, req.SourceID, err)
 	}
 
 	targetID, err := storage.ParseULID(req.TargetID)
 	if err != nil {
-		return nil, fmt.Errorf("parse target id: %w", err)
+		return nil, fmt.Errorf("%w: target_id %q: %v", ErrInvalidID, req.TargetID, err)
 	}
 
 	// Guard: reject links to/from soft-deleted engrams. A single batched
@@ -1896,6 +2297,9 @@ func (e *Engine) Link(ctx context.Context, req *mbp.LinkRequest) (*mbp.LinkRespo
 		}
 		if meta.State == storage.StateSoftDeleted {
 			return nil, ErrEngramSoftDeleted
+		}
+		if meta.State == storage.StateArchived {
+			return nil, ErrEngramArchived
 		}
 	}
 
@@ -1987,9 +2391,26 @@ func (e *Engine) Forget(ctx context.Context, req *mbp.ForgetRequest) (*mbp.Forge
 	}
 
 	if req.Hard {
+		// Read the engram before hard-deleting so we can clean up the
+		// content-hash mapping (the record is gone after DeleteEngram).
+		eng, _ := e.store.GetEngram(ctx, wsPrefix, id)
+
 		if err := e.store.DeleteEngram(ctx, wsPrefix, id); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return nil, ErrEngramNotFound
+			}
 			return nil, fmt.Errorf("hard delete: %w", err)
 		}
+
+		// Remove content-hash → engram ID mapping so the hash slot is freed
+		// and the same content can be stored again.
+		if eng != nil {
+			contentHash := storage.ContentHash(eng.Content)
+			if err := e.store.DeleteContentHash(ctx, wsPrefix, contentHash); err != nil {
+				slog.Warn("engine: failed to delete content hash after hard delete", "id", req.ID, "err", err)
+			}
+		}
+
 		// Mark the node as deleted in the HNSW index so it is skipped in
 		// future Search results. Memory is reclaimed on the next rebuild.
 		if e.hnswRegistry != nil {
@@ -2010,6 +2431,9 @@ func (e *Engine) Forget(ctx context.Context, req *mbp.ForgetRequest) (*mbp.Forge
 		// Read the engram before soft-deleting so we can clean up FTS index entries.
 		eng, readErr := e.store.GetEngram(ctx, wsPrefix, id)
 		if err := e.store.SoftDelete(ctx, wsPrefix, id); err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return nil, ErrEngramNotFound
+			}
 			return nil, fmt.Errorf("soft delete: %w", err)
 		}
 		// Remove FTS posting-list entries so soft-deleted engrams do not appear in search.
@@ -2164,10 +2588,13 @@ func (e *Engine) Restore(ctx context.Context, vault, id string) (*storage.Engram
 	}
 	eng, err := e.store.GetEngram(ctx, ws, ulid)
 	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, ErrEngramNotFound
+		}
 		return nil, fmt.Errorf("restore: %w", err)
 	}
-	if eng.State != storage.StateSoftDeleted {
-		return nil, fmt.Errorf("restore: engram %s is not soft-deleted (state=%d)", id, eng.State)
+	if eng.State != storage.StateSoftDeleted && eng.State != storage.StateArchived {
+		return nil, fmt.Errorf("restore: engram %s is not soft-deleted or archived (state=%d)", id, eng.State)
 	}
 	meta := &storage.EngramMeta{
 		State:       storage.StateActive,
@@ -2181,6 +2608,11 @@ func (e *Engine) Restore(ctx context.Context, vault, id string) (*storage.Engram
 	if err := e.store.UpdateMetadata(ctx, ws, ulid, meta); err != nil {
 		return nil, fmt.Errorf("restore update: %w", err)
 	}
+
+	// Re-add content-hash mapping so future writes detect this engram as a duplicate.
+	contentHash := storage.ContentHash(eng.Content)
+	_ = e.store.PutContentHash(ctx, ws, contentHash, ulid)
+
 	eng.State = storage.StateActive
 	return eng, nil
 }
@@ -2210,6 +2642,28 @@ func (e *Engine) UpdateLifecycleState(ctx context.Context, vault, id, state stri
 		LastAccess:  eng.LastAccess,
 	}
 	return e.store.UpdateMetadata(ctx, ws, ulid, meta)
+}
+
+// SetTrust changes the trust label of an engram identified by id (string ULID).
+// trust must be one of "verified", "inferred", "external", "untrusted".
+// Returns an error if the engram is not found or trust is invalid.
+func (e *Engine) SetTrust(ctx context.Context, vault, id, trust string) error {
+	level, err := storage.ParseTrustLevel(trust)
+	if err != nil {
+		return fmt.Errorf("parse trust: %w", err)
+	}
+	ws := e.store.ResolveVaultPrefix(vault)
+	ulid, err := storage.ParseULID(id)
+	if err != nil {
+		return fmt.Errorf("parse id: %w", err)
+	}
+	if err := e.store.UpdateTrust(ctx, ws, ulid, level); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return ErrEngramNotFound
+		}
+		return err
+	}
+	return nil
 }
 
 // ListDeleted returns soft-deleted engrams in the vault, up to limit.
@@ -2257,6 +2711,21 @@ func hashString(s string) uint32 {
 	return h
 }
 
+// ConsolidateResult is returned by Engine.Consolidate.
+type ConsolidateResult struct {
+	MergedID storage.ULID
+	Archived []string
+	Warnings []string
+}
+
+// DecideResult is returned by Engine.Decide.
+// Warnings lists any evidence IDs that could not be linked to the decision;
+// the decision itself is always committed even when evidence linking partially fails.
+type DecideResult struct {
+	ID       storage.ULID
+	Warnings []string
+}
+
 // SessionResult holds the result of a Session query.
 type SessionResult struct {
 	Writes []EngineSessionEntry
@@ -2271,10 +2740,9 @@ type EngineSessionEntry struct {
 }
 
 // Evolve creates a new version of an existing engram and soft-deletes the old one.
-// It links the new engram to the old one with RelSupersedes and returns the new ID.
-// All three writes (new engram, supersedes association, old engram state) are committed
-// in a single atomic Pebble batch so a crash cannot leave the store in an inconsistent state.
-func (e *Engine) Evolve(ctx context.Context, vault, oldID, newContent, reason string) (storage.ULID, error) {
+// concept overrides the inherited concept label; empty string inherits verbatim (#483).
+// All three writes are committed in a single atomic Pebble batch.
+func (e *Engine) Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string) (storage.ULID, error) {
 	wsPrefix := e.store.ResolveVaultPrefix(vault)
 
 	// Parse the old ULID before any writes.
@@ -2296,9 +2764,12 @@ func (e *Engine) Evolve(ctx context.Context, vault, oldID, newContent, reason st
 	// supersedes association within the same batch.
 	newULID := storage.NewULID()
 	now := time.Now()
+	if concept == "" {
+		concept = oldEng.Concept
+	}
 	newEng := &storage.Engram{
 		ID:         newULID,
-		Concept:    oldEng.Concept + " (evolved)",
+		Concept:    concept,
 		Content:    newContent,
 		Tags:       oldEng.Tags,
 		Confidence: 1.0,
@@ -2307,6 +2778,8 @@ func (e *Engine) Evolve(ctx context.Context, vault, oldID, newContent, reason st
 		CreatedAt:  now,
 		UpdatedAt:  now,
 		LastAccess: now,
+		Embedding:  embedding,
+		Trust:      storage.TrustInferred, // all new MCP writes default to inferred
 	}
 
 	// Build the supersedes association (new → old).
@@ -2336,9 +2809,31 @@ func (e *Engine) Evolve(ctx context.Context, vault, oldID, newContent, reason st
 		return storage.ULID{}, fmt.Errorf("evolve: batch commit: %w", err)
 	}
 
+	// ── Content-hash bookkeeping: delete old mapping, add new mapping ──
+	oldHash := storage.ContentHash(oldEng.Content)
+	if err := e.store.DeleteContentHash(ctx, wsPrefix, oldHash); err != nil {
+		slog.Warn("engine: evolve: failed to delete old content hash", "id", oldID, "err", err)
+	}
+	newHash := storage.ContentHash(newContent)
+	if err := e.store.PutContentHash(ctx, wsPrefix, newHash, newULID); err != nil {
+		slog.Warn("engine: evolve: failed to store new content hash", "id", newULID.String(), "err", err)
+	}
+
 	// Persist vault name (idempotent).
 	if err := e.store.WriteVaultName(wsPrefix, vault); err != nil {
 		slog.Warn("engine: failed to persist vault name", "vault", vault, "err", err)
+	}
+
+	// When the caller provided an embedding, mark DigestEmbed and insert into
+	// HNSW inline (the retroactive processor skips DigestEmbed-flagged engrams).
+	if len(embedding) > 0 {
+		existing, _ := e.store.GetDigestFlags(ctx, plugin.ULID(newULID))
+		if err := e.store.SetDigestFlag(ctx, newULID, existing|plugin.DigestEmbed); err != nil {
+			slog.Warn("engine: evolve: failed to set DigestEmbed flag", "id", newULID.String(), "err", err)
+		}
+		if err := e.hnswRegistry.Insert(ctx, wsPrefix, [16]byte(newULID), embedding); err != nil {
+			slog.Warn("engine: evolve: failed to insert client embedding into HNSW", "id", newULID.String(), "err", err)
+		}
 	}
 
 	// Submit new engram to async FTS worker.
@@ -2356,10 +2851,10 @@ func (e *Engine) Evolve(ctx context.Context, vault, oldID, newContent, reason st
 }
 
 // Consolidate merges multiple engrams into a single new engram and archives the originals.
-// Returns the new merged ID, the list of archived IDs, and any non-fatal warnings.
-func (e *Engine) Consolidate(ctx context.Context, vault string, ids []string, mergedContent string) (storage.ULID, []string, []string, error) {
+// Returns a ConsolidateResult with the new ID, archived IDs, and any non-fatal warnings.
+func (e *Engine) Consolidate(ctx context.Context, vault string, ids []string, mergedContent string) (*ConsolidateResult, error) {
 	if len(ids) > 50 {
-		return storage.ULID{}, nil, nil, fmt.Errorf("consolidate: too many ids (max 50, got %d)", len(ids))
+		return nil, fmt.Errorf("consolidate: too many ids (max 50, got %d)", len(ids))
 	}
 	mergedResp, err := e.Write(ctx, &mbp.WriteRequest{
 		Vault:   vault,
@@ -2367,7 +2862,7 @@ func (e *Engine) Consolidate(ctx context.Context, vault string, ids []string, me
 		Content: mergedContent,
 	})
 	if err != nil {
-		return storage.ULID{}, nil, nil, fmt.Errorf("consolidate: write merged: %w", err)
+		return nil, fmt.Errorf("consolidate: write merged: %w", err)
 	}
 
 	var archived []string
@@ -2383,9 +2878,9 @@ func (e *Engine) Consolidate(ctx context.Context, vault string, ids []string, me
 
 	mergedULID, err := storage.ParseULID(mergedResp.ID)
 	if err != nil {
-		return storage.ULID{}, archived, warnings, fmt.Errorf("consolidate: parse merged id: %w", err)
+		return nil, fmt.Errorf("consolidate: parse merged id: %w", err)
 	}
-	return mergedULID, archived, warnings, nil
+	return &ConsolidateResult{MergedID: mergedULID, Archived: archived, Warnings: warnings}, nil
 }
 
 // Session returns all engrams written to the vault after the given time.
@@ -2427,9 +2922,45 @@ func (e *Engine) SessionPaged(ctx context.Context, vault string, since time.Time
 	return result, nil
 }
 
+// DailyCount holds a single day's engram creation count.
+type DailyCount struct {
+	Date  string
+	Count int64
+}
+
+// ActivityCounts returns per-day engram counts between since and until
+// (inclusive) for a vault. Days are bucketed in the timezone of the since
+// argument's Location, and until is assumed to share that location; pass
+// UTC-located times for UTC-day buckets.
+func (e *Engine) ActivityCounts(ctx context.Context, vault string, since, until time.Time) ([]DailyCount, error) {
+	ws := e.store.ResolveVaultPrefix(vault)
+	counts, err := e.store.CountEngramsByDay(ctx, ws, since, until)
+	if err != nil {
+		return nil, err
+	}
+	// Build a contiguous day list so the caller always gets every day in range.
+	// Iterate calendar days in the location of the since argument so the day
+	// boundaries match how CountEngramsByDay bucketed the engrams. until is
+	// taken to share that location (the REST handler builds both together), so
+	// its own Location is intentionally not consulted. AddDate advances by a
+	// calendar day (not a fixed 24h), keeping the list correct across
+	// daylight-saving transitions.
+	loc := since.Location()
+	first := time.Date(since.Year(), since.Month(), since.Day(), 0, 0, 0, 0, loc)
+	last := time.Date(until.Year(), until.Month(), until.Day(), 0, 0, 0, 0, loc)
+	var result []DailyCount
+	for d := first; !d.After(last); d = d.AddDate(0, 0, 1) {
+		day := d.Format("2006-01-02")
+		result = append(result, DailyCount{Date: day, Count: counts[day]})
+	}
+	return result, nil
+}
+
 // Decide records an explicit decision with rationale, alternatives, and supporting evidence.
-// It returns the ULID of the newly written decision engram.
-func (e *Engine) Decide(ctx context.Context, vault, decision, rationale string, alternatives, evidenceIDs []string) (storage.ULID, error) {
+// It returns a DecideResult containing the new engram ID and any non-fatal
+// evidence-link warnings. The decision is always committed; evidence linking
+// is best-effort (a bad evidence ID produces a warning, not a failure).
+func (e *Engine) Decide(ctx context.Context, vault, decision, rationale string, alternatives, evidenceIDs []string) (*DecideResult, error) {
 	content := rationale
 	if len(alternatives) > 0 {
 		content += "\n---\nAlternatives:\n" + strings.Join(alternatives, "\n")
@@ -2442,24 +2973,27 @@ func (e *Engine) Decide(ctx context.Context, vault, decision, rationale string, 
 		Tags:    []string{"decision"},
 	})
 	if err != nil {
-		return storage.ULID{}, fmt.Errorf("decide: write: %w", err)
+		return nil, fmt.Errorf("decide: write: %w", err)
 	}
 
+	var warnings []string
 	for _, eid := range evidenceIDs {
-		_, _ = e.Link(ctx, &mbp.LinkRequest{
+		if _, err := e.Link(ctx, &mbp.LinkRequest{
 			SourceID: resp.ID,
 			TargetID: eid,
 			RelType:  uint16(storage.RelSupports),
 			Weight:   1.0,
 			Vault:    vault,
-		})
+		}); err != nil {
+			warnings = append(warnings, fmt.Sprintf("failed to link evidence %s: %v", eid, err))
+		}
 	}
 
 	decideULID, err := storage.ParseULID(resp.ID)
 	if err != nil {
-		return storage.ULID{}, fmt.Errorf("decide: parse id: %w", err)
+		return nil, fmt.Errorf("decide: parse id: %w", err)
 	}
-	return decideULID, nil
+	return &DecideResult{ID: decideULID, Warnings: warnings}, nil
 }
 
 // RecordAccess increments the access count and updates the last-accessed timestamp
@@ -2486,9 +3020,9 @@ func (e *Engine) RecordAccess(ctx context.Context, vault, id string) error {
 	return e.store.UpdateMetadata(ctx, ws, ulid, meta)
 }
 
-// resolveVaultPlasticity returns the resolved plasticity config for a vault,
+// ResolveVaultPlasticity returns the resolved plasticity config for a vault,
 // falling back to defaults when no authStore is configured.
-func (e *Engine) resolveVaultPlasticity(vaultName string) auth.ResolvedPlasticity {
+func (e *Engine) ResolveVaultPlasticity(vaultName string) auth.ResolvedPlasticity {
 	if e.authStore != nil {
 		vaultCfg, err := e.authStore.GetVaultConfig(vaultName)
 		if err == nil {
@@ -2498,21 +3032,24 @@ func (e *Engine) resolveVaultPlasticity(vaultName string) auth.ResolvedPlasticit
 	return auth.ResolvePlasticity(nil)
 }
 
-// ResolveVaultPlasticity returns the resolved plasticity config for a vault.
-func (e *Engine) ResolveVaultPlasticity(vaultName string) auth.ResolvedPlasticity {
-	return e.resolveVaultPlasticity(vaultName)
-}
-
 // PruneVault prunes a vault according to its resolved MaxEngrams and RetentionDays policy.
 // It uses hard-delete (removes all secondary indexes) to ensure pruned engrams do not
 // persist in the relevance bucket index and cause an infinite prune loop.
 // Returns the number of engrams pruned.
 func (e *Engine) PruneVault(ctx context.Context, vaultName string) (int64, error) {
+	if !e.beginVaultOp() {
+		return 0, fmt.Errorf("engine is shutting down")
+	}
+	defer e.endVaultOp()
+
+	opCtx, stop := e.vaultOpContext(ctx)
+	defer stop()
+
 	mu := e.getVaultMutex(vaultName)
 	mu.Lock()
 	defer mu.Unlock()
 
-	resolved := e.resolveVaultPlasticity(vaultName)
+	resolved := e.ResolveVaultPlasticity(vaultName)
 	ws := e.store.ResolveVaultPrefix(vaultName)
 
 	var pruned int64
@@ -2520,7 +3057,7 @@ func (e *Engine) PruneVault(ctx context.Context, vaultName string) (int64, error
 	// MaxEngrams: two-phase prune — use stale relevance index as pre-filter, then
 	// re-rank candidates by real ACT-R base-level score to delete the worst engrams.
 	if resolved.MaxEngrams > 0 {
-		count := e.store.GetVaultCount(ctx, ws)
+		count := e.store.GetVaultCount(opCtx, ws)
 		excess := count - int64(resolved.MaxEngrams)
 		if excess > 0 {
 			// Phase 1: fetch heuristic candidates from the relevance bucket index.
@@ -2528,7 +3065,7 @@ func (e *Engine) PruneVault(ctx context.Context, vaultName string) (int64, error
 			topK := int(excess) * 2
 			var candidates []storage.ULID
 			for attempt := 0; attempt < 2; attempt++ {
-				ids, err := e.store.LowestRelevanceIDs(ctx, ws, topK)
+				ids, err := e.store.LowestRelevanceIDs(opCtx, ws, topK)
 				if err != nil {
 					return pruned, fmt.Errorf("prune vault %s (max_engrams scan): %w", vaultName, err)
 				}
@@ -2551,7 +3088,7 @@ func (e *Engine) PruneVault(ctx context.Context, vaultName string) (int64, error
 			scored := make([]scoredCandidate, 0, len(candidates))
 
 			if len(candidates) > 0 {
-				metas, err := e.store.GetMetadata(ctx, ws, candidates)
+				metas, err := e.store.GetMetadata(opCtx, ws, candidates)
 				if err != nil {
 					// Fall back: delete candidates in index order without rescoring.
 					metas = nil
@@ -2583,7 +3120,7 @@ func (e *Engine) PruneVault(ctx context.Context, vaultName string) (int64, error
 			}
 			for i := 0; i < toDelete; i++ {
 				id := scored[i].id
-				if err := e.store.DeleteEngram(ctx, ws, id); err != nil {
+				if err := e.store.DeleteEngram(opCtx, ws, id); err != nil {
 					slog.Debug("prune vault: hard-delete failed", "vault", vaultName, "id", id, "err", err)
 					continue
 				}
@@ -2609,12 +3146,12 @@ func (e *Engine) PruneVault(ctx context.Context, vaultName string) (int64, error
 		// EngramIDsByCreatedRange with epoch→cutoff returns IDs of old engrams.
 		const retentionBatchSize = 500
 		epoch := time.Unix(0, 0)
-		ids, err := e.store.EngramIDsByCreatedRange(ctx, ws, epoch, cutoff, retentionBatchSize)
+		ids, err := e.store.EngramIDsByCreatedRange(opCtx, ws, epoch, cutoff, retentionBatchSize)
 		if err != nil {
 			return pruned, fmt.Errorf("prune vault %s (retention scan): %w", vaultName, err)
 		}
 		for _, id := range ids {
-			if err := e.store.DeleteEngram(ctx, ws, id); err != nil {
+			if err := e.store.DeleteEngram(opCtx, ws, id); err != nil {
 				slog.Debug("prune vault: retention hard-delete failed", "vault", vaultName, "id", id, "err", err)
 				continue
 			}
@@ -2654,7 +3191,7 @@ func (e *Engine) runPruneWorker() {
 		case <-timer.C:
 			vaults, _ := e.ListVaults(e.stopCtx)
 			for _, vaultName := range vaults {
-				resolved := e.resolveVaultPlasticity(vaultName)
+				resolved := e.ResolveVaultPlasticity(vaultName)
 				if resolved.MaxEngrams > 0 || resolved.RetentionDays > 0 {
 					if _, err := e.PruneVault(e.stopCtx, vaultName); err != nil {
 						slog.Debug("vault prune failed", "vault", vaultName, "err", err)
@@ -2662,7 +3199,7 @@ func (e *Engine) runPruneWorker() {
 				}
 			}
 			for _, vaultName := range vaults {
-				resolved := e.resolveVaultPlasticity(vaultName)
+				resolved := e.ResolveVaultPlasticity(vaultName)
 				if resolved.HebbianEnabled && resolved.AssocDecayFactor > 0 {
 					ws := e.store.ResolveVaultPrefix(vaultName)
 					removed, err := e.store.DecayAssocWeights(e.stopCtx, ws,
@@ -2857,4 +3394,3 @@ func (e *Engine) RecordFeedback(ctx context.Context, vault, engramID string, use
 	})
 	return nil
 }
-

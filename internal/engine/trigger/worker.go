@@ -55,6 +55,7 @@ type TriggerWorker struct {
 	writeEvents  <-chan *EngramEvent
 	cogEvents    <-chan CognitiveEvent
 	contraEvents <-chan ContradictEvent
+	embedEvents  <-chan *EmbedEvent
 }
 
 // Run starts the trigger event loop.
@@ -85,6 +86,12 @@ func (w *TriggerWorker) Run(ctx context.Context) error {
 			}
 			w.handleCognitive(ctx, event)
 
+		case event, ok := <-w.embedEvents:
+			if !ok {
+				return nil
+			}
+			w.handleEmbed(ctx, event)
+
 		case <-sweep.C:
 			w.handleSweep(ctx)
 			w.registry.PruneExpired()
@@ -111,6 +118,16 @@ func (w *TriggerWorker) handleWrite(ctx context.Context, event *EngramEvent) {
 	}
 
 	engramVec := event.Engram.Embedding
+
+	// On a freshly-written engram, event.Engram.Embedding is usually empty
+	// because embeddings are computed asynchronously by the retroactive processor
+	// (internal/plugin/retroactive.go) ~tens of ms later. So vectorScore is 0
+	// here, and context/threshold-filtered subscriptions can only fire via the
+	// non-vector components below (decay, recency, confidence) at write time.
+	// Once the embedding lands, the processor calls back into the engine, which
+	// invokes handleEmbed (below) to re-evaluate these subscriptions with the
+	// now-available vector — pushing a newly-matching engram exactly once, since
+	// handleEmbed skips anything already delivered here (pushedScores dedup) (#512).
 
 	for _, sub := range subs {
 		if !sub.PushOnWrite {
@@ -155,6 +172,67 @@ func (w *TriggerWorker) handleWrite(ctx context.Context, event *EngramEvent) {
 	}
 }
 
+// handleEmbed re-evaluates PushOnWrite subscriptions after an engram's embedding
+// finishes computing asynchronously (#512). handleWrite runs at write time with
+// vectorScore=0 (the embedding is not ready yet), so a context/threshold-filtered
+// subscription that should match semantically cannot fire then. Once the vector
+// lands, this pushes engrams that NOW match — but only those NOT already
+// delivered at write time (dedup via pushedScores), so a write-time match is
+// never double-pushed. The result is a single, correctly vector-scored push.
+func (w *TriggerWorker) handleEmbed(ctx context.Context, event *EmbedEvent) {
+	if event == nil || event.Engram == nil || len(event.Embedding) == 0 {
+		return
+	}
+	subs := w.registry.ForVault(event.VaultID)
+	if len(subs) == 0 {
+		return
+	}
+
+	meta := engramToMeta(event.Engram)
+	for _, sub := range subs {
+		if !sub.PushOnWrite {
+			continue
+		}
+		sub.mu.Lock()
+		_, already := sub.pushedScores[event.Engram.ID]
+		sub.mu.Unlock()
+		if already {
+			continue // already delivered at write time — no double-push
+		}
+
+		// Compute the subscription's context embedding on demand (it is created
+		// without one and otherwise only filled lazily by the periodic sweep).
+		// Without this, an embed event arriving before the first sweep would have
+		// no vector to compare and the whole point of the re-evaluation is lost.
+		subVec := w.subEmbedding(ctx, sub)
+		if len(subVec) == 0 {
+			continue
+		}
+
+		vectorScore := cosineSimilarity(subVec, event.Embedding)
+		score, above := TriggerScore(sub, meta, vectorScore, 0)
+		if !above {
+			continue
+		}
+		if !sub.rateLimiter.TryConsume() {
+			continue
+		}
+
+		w.deliver.Send(sub, &ActivationPush{
+			SubscriptionID: sub.ID,
+			Engram:         event.Engram,
+			Score:          score,
+			Trigger:        TriggerNewWrite,
+			At:             time.Now(),
+		})
+
+		sub.mu.Lock()
+		sub.pushedScores[event.Engram.ID] = score
+		sub.pushCount++
+		sub.mu.Unlock()
+	}
+}
+
 func (w *TriggerWorker) handleCognitive(ctx context.Context, event CognitiveEvent) {
 	subs := w.registry.ForVault(event.VaultID)
 	if len(subs) == 0 {
@@ -167,6 +245,9 @@ func (w *TriggerWorker) handleCognitive(ctx context.Context, event CognitiveEven
 		return
 	}
 	meta := metas[0]
+	if meta == nil {
+		return
+	}
 
 	for _, sub := range subs {
 		sub.mu.Lock()
@@ -240,7 +321,7 @@ func (w *TriggerWorker) handleContradiction(ctx context.Context, event Contradic
 
 		for _, id := range []storage.ULID{event.EngramA, event.EngramB} {
 			eng := byID[id]
-			if eng == nil || eng.State == storage.StateSoftDeleted {
+			if eng == nil || eng.State == storage.StateSoftDeleted || eng.State == storage.StateArchived {
 				continue
 			}
 			w.deliver.Send(sub, &ActivationPush{
@@ -253,6 +334,63 @@ func (w *TriggerWorker) handleContradiction(ctx context.Context, event Contradic
 			})
 		}
 	}
+}
+
+// subEmbedding returns the subscription's context embedding, computing and
+// caching it on first use. Subscriptions are created without an embedding; it is
+// filled here (by the sweep or by handleEmbed) the first time a vector is needed.
+// Returns nil if there is no embedder or the context cannot be embedded.
+func (w *TriggerWorker) subEmbedding(ctx context.Context, sub *Subscription) []float32 {
+	sub.mu.Lock()
+	vec := sub.embedding
+	subCtx := sub.Context
+	sub.mu.Unlock()
+
+	if len(vec) > 0 {
+		return vec
+	}
+	if w.embedder == nil || len(subCtx) == 0 {
+		return nil
+	}
+	computed, err := w.embedder.Embed(ctx, subCtx)
+	if err != nil || len(computed) == 0 {
+		return nil
+	}
+	// Embed returns the flat concatenation of per-phrase vectors. Pool a
+	// multi-phrase context into a single dim-sized vector so cosine against a
+	// per-engram vector is meaningful (mirrors the activation-path fix in #498).
+	if n := len(subCtx); n > 1 && len(computed)%n == 0 {
+		computed = meanPoolVec(computed, n)
+	}
+	sub.mu.Lock()
+	sub.embedding = computed
+	sub.mu.Unlock()
+	return computed
+}
+
+// meanPoolVec averages n equal-length sub-vectors concatenated in flat and
+// L2-normalizes the result, collapsing a multi-phrase embedding into one vector.
+func meanPoolVec(flat []float32, n int) []float32 {
+	dim := len(flat) / n
+	pooled := make([]float32, dim)
+	for p := 0; p < n; p++ {
+		base := p * dim
+		for i := 0; i < dim; i++ {
+			pooled[i] += flat[base+i]
+		}
+	}
+	var norm float64
+	for i := range pooled {
+		pooled[i] /= float32(n)
+		norm += float64(pooled[i]) * float64(pooled[i])
+	}
+	if norm > 0 {
+		inv := float32(1.0 / math.Sqrt(norm))
+		for i := range pooled {
+			pooled[i] *= inv
+		}
+	}
+	return pooled
 }
 
 func (w *TriggerWorker) handleSweep(ctx context.Context) {
@@ -279,29 +417,12 @@ func (w *TriggerWorker) sweepVault(ctx context.Context, vaultID uint32, ws [8]by
 	groups := make(map[[32]byte]*vecGroup)
 
 	for _, sub := range subs {
-		sub.mu.Lock()
-		vec := sub.embedding
-		subCtx := sub.Context
-		sub.mu.Unlock()
-
-		if len(vec) == 0 {
-			if w.embedder != nil {
-				computed, err := w.embedder.Embed(ctx, subCtx)
-				if err != nil {
-					continue
-				}
-				sub.mu.Lock()
-				sub.embedding = computed
-				vec = computed
-				sub.mu.Unlock()
-			}
-		}
-
+		vec := w.subEmbedding(ctx, sub)
 		if len(vec) == 0 {
 			continue
 		}
 
-		fp := contextFingerprint(subCtx)
+		fp := contextFingerprint(sub.Context)
 		if g, ok := groups[fp]; ok {
 			g.subs = append(g.subs, sub)
 		} else {
@@ -330,6 +451,9 @@ func (w *TriggerWorker) sweepVault(ctx context.Context, vaultID uint32, ws [8]by
 		}
 		metaByID := make(map[storage.ULID]*storage.EngramMeta, len(metas))
 		for _, m := range metas {
+			if m == nil {
+				continue
+			}
 			metaByID[m.ID] = m
 		}
 
@@ -355,7 +479,7 @@ func (w *TriggerWorker) sweepVault(ctx context.Context, vaultID uint32, ws [8]by
 		for _, sub := range group.subs {
 			for _, c := range candidates {
 				meta := metaByID[c.ID]
-				if meta == nil || meta.State == storage.StateSoftDeleted {
+				if meta == nil || meta.State == storage.StateSoftDeleted || meta.State == storage.StateArchived {
 					continue
 				}
 
@@ -378,7 +502,7 @@ func (w *TriggerWorker) sweepVault(ctx context.Context, vaultID uint32, ws [8]by
 				}
 
 				eng := engramByID[c.ID]
-				if eng == nil || eng.State == storage.StateSoftDeleted {
+				if eng == nil || eng.State == storage.StateSoftDeleted || eng.State == storage.StateArchived {
 					continue
 				}
 

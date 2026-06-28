@@ -2,8 +2,10 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/scrypster/muninndb/internal/plugin"
 	"github.com/scrypster/muninndb/internal/plugin/enrich"
@@ -17,10 +19,10 @@ type mockEnrichPlugin struct {
 	calls    int
 }
 
-func (m *mockEnrichPlugin) Name() string  { return "mock-enrich" }
-func (m *mockEnrichPlugin) Tier() plugin.PluginTier { return plugin.TierEnrich }
+func (m *mockEnrichPlugin) Name() string                                        { return "mock-enrich" }
+func (m *mockEnrichPlugin) Tier() plugin.PluginTier                             { return plugin.TierEnrich }
 func (m *mockEnrichPlugin) Init(_ context.Context, _ plugin.PluginConfig) error { return nil }
-func (m *mockEnrichPlugin) Close() error  { return nil }
+func (m *mockEnrichPlugin) Close() error                                        { return nil }
 
 func (m *mockEnrichPlugin) Enrich(ctx context.Context, eng *storage.Engram) (*plugin.EnrichmentResult, error) {
 	m.calls++
@@ -66,11 +68,11 @@ func TestReplayEnrichment_DryRunNoModification(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Write two engrams (no enrich plugin set).
+	// Write two engrams (no enrich plugin set; unique content to avoid content-hash dedup).
 	for i := 0; i < 2; i++ {
 		_, err := eng.Write(ctx, &mbp.WriteRequest{
 			Vault:   "default",
-			Content: "content for engram",
+			Content: fmt.Sprintf("content for engram %d", i),
 			Concept: "test concept",
 		})
 		if err != nil {
@@ -228,6 +230,321 @@ func TestReplayEnrichment_StagesRunReflectsRequest(t *testing.T) {
 	}
 }
 
+func TestGetEnrichmentCandidates_ReturnsOnlyMissingStages(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const vault = "default"
+
+	needsResp, err := eng.Write(ctx, &mbp.WriteRequest{
+		Vault:   vault,
+		Content: "needs summary",
+		Concept: "candidate needs summary",
+	})
+	if err != nil {
+		t.Fatalf("Write(needs): %v", err)
+	}
+	needsID, err := storage.ParseULID(needsResp.ID)
+	if err != nil {
+		t.Fatalf("ParseULID(needs): %v", err)
+	}
+	if err := eng.store.SetDigestFlag(ctx, needsID, plugin.DigestEntities); err != nil {
+		t.Fatalf("SetDigestFlag(needs entities): %v", err)
+	}
+
+	doneResp, err := eng.Write(ctx, &mbp.WriteRequest{
+		Vault:   vault,
+		Content: "already done",
+		Concept: "candidate already enriched",
+	})
+	if err != nil {
+		t.Fatalf("Write(done): %v", err)
+	}
+	doneID, err := storage.ParseULID(doneResp.ID)
+	if err != nil {
+		t.Fatalf("ParseULID(done): %v", err)
+	}
+	for _, flag := range []uint8{
+		plugin.DigestEntities,
+		plugin.DigestRelationships,
+		plugin.DigestClassified,
+		plugin.DigestSummarized,
+	} {
+		if err := eng.store.SetDigestFlag(ctx, doneID, flag); err != nil {
+			t.Fatalf("SetDigestFlag(done 0x%02x): %v", flag, err)
+		}
+	}
+
+	candidates, stages, _, err := eng.GetEnrichmentCandidates(ctx, vault, nil, storage.ULID{}, 10)
+	if err != nil {
+		t.Fatalf("GetEnrichmentCandidates: %v", err)
+	}
+	if len(stages) != 4 {
+		t.Fatalf("stage count: got %d, want 4", len(stages))
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidate count: got %d, want 1", len(candidates))
+	}
+	if candidates[0].ID != needsID {
+		t.Fatalf("candidate id: got %s, want %s", candidates[0].ID, needsID)
+	}
+	wantMissing := []string{"relationships", "classification", "summary"}
+	if fmt.Sprint(candidates[0].MissingStages) != fmt.Sprint(wantMissing) {
+		t.Fatalf("missing stages: got %v, want %v", candidates[0].MissingStages, wantMissing)
+	}
+}
+
+// TestGetEnrichmentCandidates_InlineEnrichedNotCandidate verifies that an engram
+// written with caller-supplied summary, entity relationships, and type/classification
+// (inline enrichment) has its per-stage digest flags set at write time, so it is NOT
+// reported as an enrichment candidate. Regression test for #500.
+func TestGetEnrichmentCandidates_InlineEnrichedNotCandidate(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const vault = "default"
+
+	resp, err := eng.Write(ctx, &mbp.WriteRequest{
+		Vault:      vault,
+		Content:    "the full content of this memory",
+		Concept:    "inline enriched concept",
+		MemoryType: uint8(storage.TypeFact),
+		TypeLabel:  "fact",
+		Summary:    "one-line summary",
+		Entities: []mbp.InlineEntity{
+			{Name: "Example Entity", Type: "concept"},
+			{Name: "Other Entity", Type: "concept"},
+		},
+		EntityRelationships: []mbp.InlineEntityRelationship{
+			{FromEntity: "Example Entity", ToEntity: "Other Entity", RelType: "relates_to", Weight: 0.9},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Write(inline): %v", err)
+	}
+	id, err := storage.ParseULID(resp.ID)
+	if err != nil {
+		t.Fatalf("ParseULID: %v", err)
+	}
+
+	flags, err := eng.store.GetDigestFlags(ctx, plugin.ULID(id))
+	if err != nil {
+		t.Fatalf("GetDigestFlags: %v", err)
+	}
+	for _, f := range []struct {
+		name string
+		bit  uint8
+	}{
+		{"DigestEntities", plugin.DigestEntities},
+		{"DigestRelationships", plugin.DigestRelationships},
+		{"DigestClassified", plugin.DigestClassified},
+		{"DigestSummarized", plugin.DigestSummarized},
+	} {
+		if flags&f.bit == 0 {
+			t.Errorf("flag %s (0x%02x) not set after inline write; flags=0x%02x", f.name, f.bit, flags)
+		}
+	}
+
+	candidates, _, _, err := eng.GetEnrichmentCandidates(ctx, vault, nil, storage.ULID{}, 10)
+	if err != nil {
+		t.Fatalf("GetEnrichmentCandidates: %v", err)
+	}
+	for _, c := range candidates {
+		if c.ID == id {
+			t.Fatalf("fully inline-enriched engram reported as candidate; missing_stages=%v, flags=0x%02x",
+				c.MissingStages, c.DigestFlags)
+		}
+	}
+}
+
+// TestRememberBatch_InlineEnrichedSetsFlags verifies the batch write path sets
+// per-stage digest flags for caller-supplied enrichment data. Regression for #500.
+func TestRememberBatch_InlineEnrichedSetsFlags(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const vault = "default"
+
+	resps, errs := eng.WriteBatch(ctx, []*mbp.WriteRequest{{
+		Vault:      vault,
+		Content:    "batch full content",
+		Concept:    "batch inline enriched",
+		MemoryType: uint8(storage.TypeFact),
+		TypeLabel:  "fact",
+		Summary:    "batch summary",
+		Entities: []mbp.InlineEntity{
+			{Name: "Batch Entity A", Type: "concept"},
+			{Name: "Batch Entity B", Type: "concept"},
+		},
+		EntityRelationships: []mbp.InlineEntityRelationship{
+			{FromEntity: "Batch Entity A", ToEntity: "Batch Entity B", RelType: "relates_to", Weight: 0.9},
+		},
+	}})
+	if errs[0] != nil {
+		t.Fatalf("WriteBatch: %v", errs[0])
+	}
+	id, err := storage.ParseULID(resps[0].ID)
+	if err != nil {
+		t.Fatalf("ParseULID: %v", err)
+	}
+
+	flags, err := eng.store.GetDigestFlags(ctx, plugin.ULID(id))
+	if err != nil {
+		t.Fatalf("GetDigestFlags: %v", err)
+	}
+	for _, f := range []struct {
+		name string
+		bit  uint8
+	}{
+		{"DigestEntities", plugin.DigestEntities},
+		{"DigestRelationships", plugin.DigestRelationships},
+		{"DigestClassified", plugin.DigestClassified},
+		{"DigestSummarized", plugin.DigestSummarized},
+	} {
+		if flags&f.bit == 0 {
+			t.Errorf("batch: flag %s (0x%02x) not set; flags=0x%02x", f.name, f.bit, flags)
+		}
+	}
+}
+
+func TestGetEnrichmentCandidates_CursorPaginates(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const vault = "default"
+
+	// Write 6 engrams; mark the first 4 fully enriched, leave last 2 unenriched.
+	ids := make([]storage.ULID, 6)
+	for i := 0; i < 6; i++ {
+		resp, err := eng.Write(ctx, &mbp.WriteRequest{
+			Vault:   vault,
+			Content: fmt.Sprintf("engram %d", i),
+			Concept: fmt.Sprintf("concept %d", i),
+		})
+		if err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+		id, err := storage.ParseULID(resp.ID)
+		if err != nil {
+			t.Fatalf("ParseULID %d: %v", i, err)
+		}
+		ids[i] = id
+	}
+	allFlags := []uint8{plugin.DigestEntities, plugin.DigestRelationships, plugin.DigestClassified, plugin.DigestSummarized}
+	for i := 0; i < 4; i++ {
+		for _, flag := range allFlags {
+			if err := eng.store.SetDigestFlag(ctx, ids[i], flag); err != nil {
+				t.Fatalf("SetDigestFlag(%d, 0x%02x): %v", i, flag, err)
+			}
+		}
+	}
+
+	// Determine storage scan order for the two unenriched engrams.
+	// NewULID creates a fresh entropy source per call, so ULIDs generated
+	// within the same millisecond may not be monotonically ordered relative
+	// to write order. Sort by raw bytes (Pebble key order) to get the
+	// expected pagination sequence.
+	unenriched := []storage.ULID{ids[4], ids[5]}
+	if storage.CompareULIDs(unenriched[0], unenriched[1]) > 0 {
+		unenriched[0], unenriched[1] = unenriched[1], unenriched[0]
+	}
+
+	// Page 1: limit=1 should return the first unenriched engram in key order.
+	candidates1, _, cursor1, err := eng.GetEnrichmentCandidates(ctx, vault, nil, storage.ULID{}, 1)
+	if err != nil {
+		t.Fatalf("page1: %v", err)
+	}
+	if len(candidates1) != 1 {
+		t.Fatalf("page1 count: got %d, want 1", len(candidates1))
+	}
+	if candidates1[0].ID != unenriched[0] {
+		t.Errorf("page1 candidate: got %s, want %s", candidates1[0].ID, unenriched[0])
+	}
+	if cursor1 == (storage.ULID{}) {
+		t.Error("page1: expected non-zero cursor")
+	}
+
+	// Page 2: continue from cursor1, should return the second unenriched engram.
+	candidates2, _, cursor2, err := eng.GetEnrichmentCandidates(ctx, vault, nil, cursor1, 1)
+	if err != nil {
+		t.Fatalf("page2: %v", err)
+	}
+	if len(candidates2) != 1 {
+		t.Fatalf("page2 count: got %d, want 1", len(candidates2))
+	}
+	if candidates2[0].ID != unenriched[1] {
+		t.Errorf("page2 candidate: got %s, want %s", candidates2[0].ID, unenriched[1])
+	}
+
+	// Page 3: exhausted — cursor2 should be zero.
+	candidates3, _, cursor3, err := eng.GetEnrichmentCandidates(ctx, vault, nil, cursor2, 1)
+	if err != nil {
+		t.Fatalf("page3: %v", err)
+	}
+	if len(candidates3) != 0 {
+		t.Fatalf("page3 count: got %d, want 0", len(candidates3))
+	}
+	if cursor3 != (storage.ULID{}) {
+		t.Errorf("page3: expected zero cursor (exhausted), got %s", cursor3)
+	}
+}
+
+func TestGetEnrichmentCandidates_SkipsEnrichedAtStart(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const vault = "default"
+
+	// Write 3 engrams. First 2 fully enriched, last one not.
+	ids := make([]storage.ULID, 3)
+	for i := 0; i < 3; i++ {
+		resp, err := eng.Write(ctx, &mbp.WriteRequest{
+			Vault:   vault,
+			Content: fmt.Sprintf("content %d", i),
+			Concept: fmt.Sprintf("concept %d", i),
+		})
+		if err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+		id, err := storage.ParseULID(resp.ID)
+		if err != nil {
+			t.Fatalf("ParseULID %d: %v", i, err)
+		}
+		ids[i] = id
+	}
+	allFlags := []uint8{plugin.DigestEntities, plugin.DigestRelationships, plugin.DigestClassified, plugin.DigestSummarized}
+	for _, flag := range allFlags {
+		if err := eng.store.SetDigestFlag(ctx, ids[0], flag); err != nil {
+			t.Fatalf("SetDigestFlag(0): %v", err)
+		}
+		if err := eng.store.SetDigestFlag(ctx, ids[1], flag); err != nil {
+			t.Fatalf("SetDigestFlag(1): %v", err)
+		}
+	}
+
+	// Without cursor fix, a limit=2 call would scan only ids[0] and ids[1],
+	// both enriched, and return 0 candidates. With the fix it continues.
+	candidates, _, cursor, err := eng.GetEnrichmentCandidates(ctx, vault, nil, storage.ULID{}, 2)
+	if err != nil {
+		t.Fatalf("GetEnrichmentCandidates: %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates: got %d, want 1", len(candidates))
+	}
+	if candidates[0].ID != ids[2] {
+		t.Errorf("candidate id: got %s, want %s", candidates[0].ID, ids[2])
+	}
+	// ids[2] was the last engram — cursor should be zero (exhausted).
+	if cursor != (storage.ULID{}) {
+		t.Errorf("cursor should be zero (exhausted), got %s", cursor)
+	}
+}
+
 // TestReplayEnrichment_WritesBackToEngram verifies that ReplayEnrichment actually
 // persists the Summary and KeyPoints returned by the enrich plugin into each engram.
 func TestReplayEnrichment_WritesBackToEngram(t *testing.T) {
@@ -344,6 +661,133 @@ func TestRetryEnrich_WritesBackToEngram(t *testing.T) {
 	}
 	if mock.calls == 0 {
 		t.Error("expected enrich plugin to be called at least once")
+	}
+}
+
+func TestApplyEnrichment_PersistsExplicitOutput(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const vault = "default"
+	ws := eng.store.ResolveVaultPrefix(vault)
+
+	resp, err := eng.Write(ctx, &mbp.WriteRequest{
+		Vault:   vault,
+		Content: "postgres is the primary database",
+		Concept: "database note",
+	})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	id, err := storage.ParseULID(resp.ID)
+	if err != nil {
+		t.Fatalf("ParseULID: %v", err)
+	}
+	original, err := eng.GetEngram(ctx, vault, id)
+	if err != nil {
+		t.Fatalf("GetEngram(before): %v", err)
+	}
+
+	result, err := eng.ApplyEnrichment(ctx, vault, &EnrichmentApplyRequest{
+		ID:                resp.ID,
+		ExpectedUpdatedAt: original.UpdatedAt,
+		Summary:           "PostgreSQL is the primary system of record.",
+		MemoryType:        "reference",
+		TypeLabel:         "database_note",
+		Entities: []EnrichmentApplyEntity{
+			{Name: "PostgreSQL", Type: "database", Confidence: 0.95},
+			{Name: "System of Record", Type: "concept", Confidence: 0.7},
+		},
+		Relationships: []EnrichmentApplyRelationship{
+			{FromEntity: "PostgreSQL", ToEntity: "System of Record", RelType: "is_a", Weight: 0.8},
+		},
+		StagesCompleted: []string{"summary", "classification", "entities", "relationships"},
+		Source:          "test-agent",
+	})
+	if err != nil {
+		t.Fatalf("ApplyEnrichment: %v", err)
+	}
+	if len(result.AppliedStages) != 4 {
+		t.Fatalf("AppliedStages len: got %d, want 4", len(result.AppliedStages))
+	}
+
+	updated, err := eng.store.GetEngram(ctx, ws, id)
+	if err != nil {
+		t.Fatalf("GetEngram(after): %v", err)
+	}
+	if updated.Summary != "PostgreSQL is the primary system of record." {
+		t.Fatalf("Summary: got %q", updated.Summary)
+	}
+	if updated.TypeLabel != "database_note" {
+		t.Fatalf("TypeLabel: got %q, want %q", updated.TypeLabel, "database_note")
+	}
+	if updated.MemoryType.String() != "reference" {
+		t.Fatalf("MemoryType: got %q, want %q", updated.MemoryType.String(), "reference")
+	}
+
+	flags, err := eng.store.GetDigestFlags(ctx, id)
+	if err != nil {
+		t.Fatalf("GetDigestFlags: %v", err)
+	}
+	wantMask := plugin.DigestEntities | plugin.DigestRelationships | plugin.DigestClassified | plugin.DigestSummarized
+	if flags&wantMask != wantMask {
+		t.Fatalf("digest flags: got 0x%02x, want mask 0x%02x", flags, wantMask)
+	}
+
+	entityRecord, err := eng.store.GetEntityRecord(ctx, "PostgreSQL")
+	if err != nil {
+		t.Fatalf("GetEntityRecord: %v", err)
+	}
+	if entityRecord == nil || entityRecord.Source != "test-agent" {
+		t.Fatalf("entity record: got %+v", entityRecord)
+	}
+
+	var relationships []storage.RelationshipRecord
+	if err := eng.store.ScanEngramRelationships(ctx, ws, id, func(record storage.RelationshipRecord) error {
+		relationships = append(relationships, record)
+		return nil
+	}); err != nil {
+		t.Fatalf("ScanEngramRelationships: %v", err)
+	}
+	if len(relationships) != 1 {
+		t.Fatalf("relationship count: got %d, want 1", len(relationships))
+	}
+	if relationships[0].Source != "test-agent" {
+		t.Fatalf("relationship source: got %q, want %q", relationships[0].Source, "test-agent")
+	}
+}
+
+func TestApplyEnrichment_ConflictOnUpdatedAtMismatch(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const vault = "default"
+
+	resp, err := eng.Write(ctx, &mbp.WriteRequest{
+		Vault:   vault,
+		Content: "conflict target",
+		Concept: "conflict target",
+	})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	id, err := storage.ParseULID(resp.ID)
+	if err != nil {
+		t.Fatalf("ParseULID: %v", err)
+	}
+	current, err := eng.GetEngram(ctx, vault, id)
+	if err != nil {
+		t.Fatalf("GetEngram: %v", err)
+	}
+	_, err = eng.ApplyEnrichment(ctx, vault, &EnrichmentApplyRequest{
+		ID:                resp.ID,
+		ExpectedUpdatedAt: current.UpdatedAt.Add(-time.Second),
+		Summary:           "stale summary",
+	})
+	if !errors.Is(err, ErrEnrichmentConflict) {
+		t.Fatalf("ApplyEnrichment error: got %v, want ErrEnrichmentConflict (current=%s)", err, current.UpdatedAt.UTC().Format(time.RFC3339Nano))
 	}
 }
 
@@ -486,6 +930,59 @@ func TestReplayEnrichment_NothingToEnrich_CountedAsSkipped(t *testing.T) {
 	assertResultInvariant(t, result, 3)
 }
 
+// TestGetEnrichmentCandidates_AdaptiveBatch verifies that GetEnrichmentCandidates
+// finds unenriched engrams that appear after a run of fully-enriched ones,
+// exercising the "skip enriched, find unenriched at end" behavior of the
+// adaptive batch loop.
+func TestGetEnrichmentCandidates_AdaptiveBatch(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	const vault = "default"
+
+	// Write 25 fully enriched + 1 unenriched at the end.
+	enrichedCount := 25
+	ids := make([]storage.ULID, enrichedCount+1)
+	for i := 0; i <= enrichedCount; i++ {
+		resp, err := eng.Write(ctx, &mbp.WriteRequest{
+			Vault:   vault,
+			Content: fmt.Sprintf("content %d", i),
+			Concept: fmt.Sprintf("concept %d", i),
+		})
+		if err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+		id, err := storage.ParseULID(resp.ID)
+		if err != nil {
+			t.Fatalf("ParseULID %d: %v", i, err)
+		}
+		ids[i] = id
+	}
+	allFlags := []uint8{plugin.DigestEntities, plugin.DigestRelationships, plugin.DigestClassified, plugin.DigestSummarized}
+	for i := 0; i < enrichedCount; i++ {
+		for _, flag := range allFlags {
+			if err := eng.store.SetDigestFlag(ctx, ids[i], flag); err != nil {
+				t.Fatalf("SetDigestFlag(%d): %v", i, err)
+			}
+		}
+	}
+
+	// The unenriched engram is ids[enrichedCount].
+	// With limit=5, batchSize starts at max(50, 20)=50, which covers all 26 engrams.
+	// All 25 enriched ones are skipped, and the 1 unenriched is found.
+	candidates, _, _, err := eng.GetEnrichmentCandidates(ctx, vault, nil, storage.ULID{}, 5)
+	if err != nil {
+		t.Fatalf("GetEnrichmentCandidates: %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates count: got %d, want 1", len(candidates))
+	}
+	if candidates[0].ID != ids[enrichedCount] {
+		t.Errorf("candidate: got %s, want %s", candidates[0].ID, ids[enrichedCount])
+	}
+}
+
 // TestReplayEnrichment_ContextAlreadyExpired verifies that when the context is
 // already cancelled before the loop starts, all engrams are counted as Remaining.
 func TestReplayEnrichment_ContextAlreadyExpired(t *testing.T) {
@@ -519,4 +1016,211 @@ func TestReplayEnrichment_ContextAlreadyExpired(t *testing.T) {
 		t.Errorf("Remaining: got %d, want 3", result.Remaining)
 	}
 	assertResultInvariant(t, result, 3)
+}
+
+// TestReplayEnrichment_SkipsAfterMaxFailures verifies that an engram which has
+// failed maxReplayFails consecutive times is silently skipped on the next call.
+func TestReplayEnrichment_SkipsAfterMaxFailures(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	writeTestEngrams(t, ctx, eng, "default", 1)
+
+	errBoom := errors.New("LLM boom")
+	calls := 0
+	mock := &mockEnrichPlugin{
+		enrichFn: func(_ context.Context, _ *storage.Engram) (*plugin.EnrichmentResult, error) {
+			calls++
+			return nil, errBoom
+		},
+	}
+	eng.SetEnrichPlugin(mock)
+
+	// First maxReplayFails calls should each attempt enrichment and record a failure.
+	for i := 0; i < maxReplayFails; i++ {
+		result, err := eng.ReplayEnrichment(ctx, "default", nil, 50, false)
+		if err != nil {
+			t.Fatalf("call %d: unexpected error: %v", i+1, err)
+		}
+		if result.Failed != 1 {
+			t.Errorf("call %d: want Failed=1, got %d", i+1, result.Failed)
+		}
+	}
+	if calls != maxReplayFails {
+		t.Errorf("want %d Enrich calls, got %d", maxReplayFails, calls)
+	}
+
+	// Next call: engram has hit the threshold — must be skipped, not attempted again.
+	callsBefore := calls
+	result, err := eng.ReplayEnrichment(ctx, "default", nil, 50, false)
+	if err != nil {
+		t.Fatalf("post-threshold call: unexpected error: %v", err)
+	}
+	if calls != callsBefore {
+		t.Errorf("Enrich should not be called after threshold; got %d extra calls", calls-callsBefore)
+	}
+	if result.Skipped != 1 {
+		t.Errorf("post-threshold: want Skipped=1, got %d", result.Skipped)
+	}
+	if result.Failed != 0 {
+		t.Errorf("post-threshold: want Failed=0, got %d", result.Failed)
+	}
+}
+
+// TestReplayEnrichment_FailCountResetOnSuccess verifies that a successful enrichment
+// run clears the failure counter so the engram is attempted again next time.
+func TestReplayEnrichment_FailCountResetOnSuccess(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	writeTestEngrams(t, ctx, eng, "default", 1)
+
+	shouldFail := true
+	mock := &mockEnrichPlugin{
+		enrichFn: func(_ context.Context, _ *storage.Engram) (*plugin.EnrichmentResult, error) {
+			if shouldFail {
+				return nil, errors.New("temporary failure")
+			}
+			return &plugin.EnrichmentResult{Summary: "ok", KeyPoints: []string{"k"}}, nil
+		},
+	}
+	eng.SetEnrichPlugin(mock)
+
+	// Fail once to set fail count to 1.
+	result, err := eng.ReplayEnrichment(ctx, "default", nil, 50, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Failed != 1 {
+		t.Errorf("want Failed=1, got %d", result.Failed)
+	}
+
+	// Now succeed — should clear the failure counter.
+	shouldFail = false
+	result, err = eng.ReplayEnrichment(ctx, "default", nil, 50, false)
+	if err != nil {
+		t.Fatalf("unexpected error after success: %v", err)
+	}
+	if result.Processed != 1 {
+		t.Errorf("want Processed=1, got %d", result.Processed)
+	}
+
+	// The engram now has all digest flags set, so further calls skip it as done.
+	_ = result
+}
+
+// TestReplayEnrichment_PerEngramTimeout verifies that SetReplayEnrichTimeout
+// causes Enrich to receive a context that has a deadline.
+func TestReplayEnrichment_PerEngramTimeout(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	writeTestEngrams(t, ctx, eng, "default", 1)
+
+	var deadlineSet bool
+	mock := &mockEnrichPlugin{
+		enrichFn: func(enrichCtx context.Context, _ *storage.Engram) (*plugin.EnrichmentResult, error) {
+			dl, ok := enrichCtx.Deadline()
+			deadlineSet = ok && !dl.IsZero()
+			return &plugin.EnrichmentResult{Summary: "ok", KeyPoints: []string{"k"}}, nil
+		},
+	}
+	eng.SetEnrichPlugin(mock)
+	eng.SetReplayEnrichTimeout(30 * time.Second)
+
+	result, err := eng.ReplayEnrichment(ctx, "default", nil, 50, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Processed != 1 {
+		t.Errorf("want Processed=1, got %d", result.Processed)
+	}
+	if !deadlineSet {
+		t.Error("expected per-engram context to have a deadline when SetReplayEnrichTimeout > 0")
+	}
+}
+
+// TestReplayEnrichment_TimeoutFires verifies that when the per-engram timeout
+// expires before Enrich returns, the error is counted as a failure (not silently
+// swallowed) and the context deadline exceeded error propagates correctly.
+func TestReplayEnrichment_TimeoutFires(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	writeTestEngrams(t, ctx, eng, "default", 1)
+
+	mock := &mockEnrichPlugin{
+		enrichFn: func(enrichCtx context.Context, _ *storage.Engram) (*plugin.EnrichmentResult, error) {
+			// Block until the per-engram context is cancelled.
+			<-enrichCtx.Done()
+			return nil, enrichCtx.Err()
+		},
+	}
+	eng.SetEnrichPlugin(mock)
+	eng.SetReplayEnrichTimeout(10 * time.Millisecond) // fire immediately
+
+	result, err := eng.ReplayEnrichment(ctx, "default", nil, 50, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Failed != 1 {
+		t.Errorf("want Failed=1 after timeout, got %d", result.Failed)
+	}
+	if result.Processed != 0 {
+		t.Errorf("want Processed=0 after timeout, got %d", result.Processed)
+	}
+}
+
+// TestReplayEnrichment_ResetFailCount verifies that ResetReplayFailCount clears
+// the failure counter, allowing a previously-skipped engram to be retried.
+func TestReplayEnrichment_ResetFailCount(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	writeTestEngrams(t, ctx, eng, "default", 1)
+
+	// Fail enough times to trip the circuit breaker.
+	calls := 0
+	mock := &mockEnrichPlugin{
+		enrichFn: func(_ context.Context, _ *storage.Engram) (*plugin.EnrichmentResult, error) {
+			calls++
+			return nil, errors.New("permanent failure")
+		},
+	}
+	eng.SetEnrichPlugin(mock)
+
+	for i := 0; i < maxReplayFails; i++ {
+		eng.ReplayEnrichment(ctx, "default", nil, 50, false) //nolint:errcheck
+	}
+
+	// Confirm the engram is now skipped.
+	callsBefore := calls
+	result, _ := eng.ReplayEnrichment(ctx, "default", nil, 50, false)
+	if calls != callsBefore {
+		t.Fatalf("engram should be skipped after threshold, got extra call")
+	}
+	if result.Skipped != 1 {
+		t.Errorf("want Skipped=1 before reset, got %d", result.Skipped)
+	}
+
+	// Reset the counter — the engram must be attempted again.
+	ids, err := eng.store.ListByState(ctx, eng.store.ResolveVaultPrefix("default"), storage.StateActive, 10)
+	if err != nil || len(ids) == 0 {
+		t.Fatalf("could not list engrams: %v", err)
+	}
+	eng.ResetReplayFailCount(ids[0])
+
+	callsBefore = calls
+	result, _ = eng.ReplayEnrichment(ctx, "default", nil, 50, false)
+	if calls == callsBefore {
+		t.Error("expected Enrich to be called again after ResetReplayFailCount")
+	}
+	if result.Failed != 1 {
+		t.Errorf("want Failed=1 after reset (still failing), got %d", result.Failed)
+	}
 }

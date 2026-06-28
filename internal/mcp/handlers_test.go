@@ -21,7 +21,7 @@ import (
 
 // newTestServerWith creates a server backed by the supplied engine.
 func newTestServerWith(eng EngineInterface) *MCPServer {
-	return New(":0", eng, "", nil)
+	return New(":0", eng, "", nil, nil)
 }
 
 // extractInnerJSON decodes the MCP textContent envelope and returns the inner
@@ -168,7 +168,7 @@ func (e *noPluginsEngine) RetryEnrich(_ context.Context, _ string, id string) (*
 // configurable CheckIdempotency responses for testing the op_id path.
 type idempotentEngine struct {
 	fakeEngine
-	receipt   *storage.IdempotencyReceipt // non-nil → return this on CheckIdempotency
+	receipt    *storage.IdempotencyReceipt // non-nil → return this on CheckIdempotency
 	writeCalls int
 }
 
@@ -873,6 +873,48 @@ func TestHandleRecallEmptySourceTypeOmitted(t *testing.T) {
 	}
 }
 
+// recallWithTrustEngine returns an ActivateResponse with a single ActivationItem
+// where Trust is set to TrustVerified, so that activationToMemory propagation can be verified.
+type recallWithTrustEngine struct{ fakeEngine }
+
+func (e *recallWithTrustEngine) Activate(_ context.Context, req *mbp.ActivateRequest) (*mbp.ActivateResponse, error) {
+	return &mbp.ActivateResponse{
+		Activations: []mbp.ActivationItem{
+			{
+				ID:      "trust-001",
+				Concept: "trust concept",
+				Content: "trust content",
+				Score:   0.8,
+				Trust:   uint8(storage.TrustVerified),
+			},
+		},
+	}, nil
+}
+
+func TestHandleRecall_IncludesTrust(t *testing.T) {
+	srv := newTestServerWith(&recallWithTrustEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_recall","arguments":{"vault":"default","context":["test"]}}}`
+	w := postRPC(t, srv, body)
+	outer := extractInnerJSON(t, decodeResp(t, w.Body.String()))
+
+	memories, ok := outer["memories"].([]any)
+	if !ok || len(memories) == 0 {
+		t.Fatalf("expected non-empty memories array, got %T %v", outer["memories"], outer["memories"])
+	}
+	mem, ok := memories[0].(map[string]any)
+	if !ok {
+		t.Fatalf("memories[0] should be an object, got %T", memories[0])
+	}
+
+	trust, ok := mem["trust"].(string)
+	if !ok {
+		t.Fatalf("expected trust field to be a string, got %T (%v)", mem["trust"], mem["trust"])
+	}
+	if trust != "verified" {
+		t.Errorf("trust = %q, want %q", trust, "verified")
+	}
+}
+
 // ── muninn_read ──────────────────────────────────────────────────────────────
 
 // readWithDataEngine returns a populated ReadResponse so shape assertions are meaningful.
@@ -910,6 +952,99 @@ func TestHandleRead_MissingID(t *testing.T) {
 	resp := decodeResp(t, w.Body.String())
 	if resp.Error == nil || resp.Error.Code != -32602 {
 		t.Errorf("expected -32602, got %v", resp.Error)
+	}
+}
+
+// readWithEntitiesEngine returns a ReadResponse with entities and entity relationships.
+type readWithEntitiesEngine struct{ fakeEngine }
+
+func (e *readWithEntitiesEngine) Read(_ context.Context, req *mbp.ReadRequest) (*mbp.ReadResponse, error) {
+	return &mbp.ReadResponse{
+		ID:      req.ID,
+		Concept: "test concept",
+		Content: "test content body",
+		Entities: []mbp.InlineEntity{
+			{Name: "Alice", Type: "person"},
+			{Name: "Bob", Type: "person"},
+		},
+		EntityRelationships: []mbp.InlineEntityRelationship{
+			{FromEntity: "Alice", ToEntity: "Bob", RelType: "manages", Weight: 1.0},
+		},
+	}, nil
+}
+
+func TestHandleRead_IncludesEntitiesAndRelationships(t *testing.T) {
+	srv := newTestServerWith(&readWithEntitiesEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_read","arguments":{"vault":"default","id":"abc-123"}}}`
+	w := postRPC(t, srv, body)
+	content := extractInnerJSON(t, decodeResp(t, w.Body.String()))
+
+	entities, ok := content["entities"].([]any)
+	if !ok || len(entities) != 2 {
+		t.Fatalf("expected 2 entities, got %v", content["entities"])
+	}
+	e0 := entities[0].(map[string]any)
+	if e0["name"] == nil {
+		t.Error("entity missing 'name' field")
+	}
+	if e0["type"] == nil {
+		t.Error("entity missing 'type' field")
+	}
+
+	rels, ok := content["entity_relationships"].([]any)
+	if !ok || len(rels) != 1 {
+		t.Fatalf("expected 1 entity_relationship, got %v", content["entity_relationships"])
+	}
+	r0 := rels[0].(map[string]any)
+	if r0["from_entity"] != "Alice" {
+		t.Errorf("from_entity = %v, want Alice", r0["from_entity"])
+	}
+	if r0["to_entity"] != "Bob" {
+		t.Errorf("to_entity = %v, want Bob", r0["to_entity"])
+	}
+	if r0["rel_type"] != "manages" {
+		t.Errorf("rel_type = %v, want manages", r0["rel_type"])
+	}
+}
+
+func TestHandleRead_NoEntitiesOmitsFields(t *testing.T) {
+	srv := newTestServerWith(&readWithDataEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_read","arguments":{"vault":"default","id":"abc-123"}}}`
+	w := postRPC(t, srv, body)
+	content := extractInnerJSON(t, decodeResp(t, w.Body.String()))
+
+	if _, ok := content["entities"]; ok {
+		t.Error("entities field should be omitted when empty")
+	}
+	if _, ok := content["entity_relationships"]; ok {
+		t.Error("entity_relationships field should be omitted when empty")
+	}
+}
+
+// readWithTrustEngine returns a ReadResponse with Trust set to TrustInferred.
+type readWithTrustEngine struct{ fakeEngine }
+
+func (e *readWithTrustEngine) Read(_ context.Context, req *mbp.ReadRequest) (*mbp.ReadResponse, error) {
+	return &mbp.ReadResponse{
+		ID:      req.ID,
+		Concept: "test concept",
+		Content: "test content body",
+		Trust:   uint8(storage.TrustInferred),
+	}, nil
+}
+
+func TestHandleRead_IncludesTrust(t *testing.T) {
+	srv := newTestServerWith(&readWithTrustEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_read","arguments":{"vault":"default","id":"abc-123"}}}`
+	w := postRPC(t, srv, body)
+	content := extractInnerJSON(t, decodeResp(t, w.Body.String()))
+
+	trust, ok := content["trust"].(string)
+	if !ok {
+		t.Fatalf("expected trust field to be a string, got %T (%v)", content["trust"], content["trust"])
+	}
+	if trust != "inferred" {
+		t.Errorf("trust = %q, want %q", trust, "inferred")
 	}
 }
 
@@ -1472,7 +1607,8 @@ func TestHandleRemember_NoOpID(t *testing.T) {
 // in handleRemember, both goroutines would see a nil receipt and each call
 // Write — producing two engrams for a single op_id.
 type slowIdempotentEngine struct {
-	mu        sync.Mutex
+	fakeEngine
+	mu         sync.Mutex
 	writeCalls int32 // accessed atomically
 
 	// storedReceipt is written after the first Write completes; subsequent
@@ -1528,8 +1664,8 @@ func (e *slowIdempotentEngine) Stat(ctx context.Context, req *mbp.StatRequest) (
 func (e *slowIdempotentEngine) GetContradictions(ctx context.Context, vault string) ([]ContradictionPair, error) {
 	return (&fakeEngine{}).GetContradictions(ctx, vault)
 }
-func (e *slowIdempotentEngine) Evolve(ctx context.Context, vault, oldID, newContent, reason string) (*WriteResult, error) {
-	return (&fakeEngine{}).Evolve(ctx, vault, oldID, newContent, reason)
+func (e *slowIdempotentEngine) Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string) (*WriteResult, error) {
+	return (&fakeEngine{}).Evolve(ctx, vault, oldID, newContent, reason, embedding, concept)
 }
 func (e *slowIdempotentEngine) Consolidate(ctx context.Context, vault string, ids []string, merged string) (*ConsolidateResult, error) {
 	return (&fakeEngine{}).Consolidate(ctx, vault, ids, merged)
@@ -1582,8 +1718,11 @@ func (e *slowIdempotentEngine) WhereLeftOff(ctx context.Context, vault string, l
 func (e *slowIdempotentEngine) FindByEntity(ctx context.Context, vault, entityName string, limit int) ([]*storage.Engram, error) {
 	return (&fakeEngine{}).FindByEntity(ctx, vault, entityName, limit)
 }
-func (e *slowIdempotentEngine) SetEntityState(ctx context.Context, entityName, state, mergedInto string) error {
-	return (&fakeEngine{}).SetEntityState(ctx, entityName, state, mergedInto)
+func (e *slowIdempotentEngine) SetEntityState(ctx context.Context, entityName, state, mergedInto, entityType string) error {
+	return (&fakeEngine{}).SetEntityState(ctx, entityName, state, mergedInto, entityType)
+}
+func (e *slowIdempotentEngine) SetEntityStateBatch(ctx context.Context, ops []engine.EntityStateOp) []error {
+	return (&fakeEngine{}).SetEntityStateBatch(ctx, ops)
 }
 func (e *slowIdempotentEngine) GetEntityClusters(ctx context.Context, vault string, minCount, topN int) ([]EntityClusterResult, error) {
 	return (&fakeEngine{}).GetEntityClusters(ctx, vault, minCount, topN)
@@ -1614,6 +1753,12 @@ func (e *slowIdempotentEngine) GetEntityAggregate(ctx context.Context, vault, en
 }
 func (e *slowIdempotentEngine) ListEntities(ctx context.Context, vault string, limit int, state string) ([]EntitySummary, error) {
 	return (&fakeEngine{}).ListEntities(ctx, vault, limit, state)
+}
+func (e *slowIdempotentEngine) GetVaultEmbedDim(ctx context.Context, vault string) int {
+	return (&fakeEngine{}).GetVaultEmbedDim(ctx, vault)
+}
+func (e *slowIdempotentEngine) SetTrust(ctx context.Context, vault, id, trust string) error {
+	return (&fakeEngine{}).SetTrust(ctx, vault, id, trust)
 }
 
 // TestHandleRemember_ConcurrentSameOpID verifies that two concurrent
@@ -1670,7 +1815,7 @@ func TestHandleRemember_ConcurrentSameOpID(t *testing.T) {
 // entityStateEngine is a minimal engine stub for muninn_entity_state tests.
 type entityStateEngine struct{ fakeEngine }
 
-func (e *entityStateEngine) SetEntityState(_ context.Context, name, state, mergedInto string) error {
+func (e *entityStateEngine) SetEntityState(_ context.Context, name, state, mergedInto, entityType string) error {
 	if name == "" {
 		return fmt.Errorf("entity_name is required")
 	}
@@ -1680,7 +1825,7 @@ func (e *entityStateEngine) SetEntityState(_ context.Context, name, state, merge
 // entityStateErrEngine returns an error from SetEntityState.
 type entityStateErrEngine struct{ fakeEngine }
 
-func (e *entityStateErrEngine) SetEntityState(_ context.Context, _, _, _ string) error {
+func (e *entityStateErrEngine) SetEntityState(_ context.Context, _, _, _, _ string) error {
 	return fmt.Errorf("entity %q not found", "PostgreSQL")
 }
 
@@ -1772,6 +1917,171 @@ func TestHandleEntityStateMergedWithoutMergedInto(t *testing.T) {
 	}
 	if resp.Error != nil && !strings.Contains(resp.Error.Message, "merged_into") {
 		t.Errorf("expected error message to mention merged_into requirement, got: %q", resp.Error.Message)
+	}
+}
+
+func TestHandleEntityStateWithType(t *testing.T) {
+	// Verify that providing a valid "type" field succeeds and is reflected in
+	// the response after normalisation (issue #501: types are now normalised
+	// and unknown values coerced to "other", matching muninn_remember).
+	srv := newTestServerWith(&entityStateEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_entity_state","arguments":{"vault":"default","entity_name":"PostgreSQL","state":"active","type":"Database"}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	content := extractInnerJSON(t, resp)
+	if content["type"] != "database" {
+		t.Errorf("type = %v, want database (normalized)", content["type"])
+	}
+	if content["entity"] != "PostgreSQL" {
+		t.Errorf("entity = %v, want PostgreSQL", content["entity"])
+	}
+}
+
+func TestHandleEntityStateWithoutTypeOmitsTypeField(t *testing.T) {
+	// Verify that omitting "type" does not include a "type" key in the response.
+	srv := newTestServerWith(&entityStateEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_entity_state","arguments":{"vault":"default","entity_name":"PostgreSQL","state":"active"}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	content := extractInnerJSON(t, resp)
+	if _, hasType := content["type"]; hasType {
+		t.Errorf("response should not include 'type' field when type was not provided")
+	}
+}
+
+// ── muninn_entity_state_batch tests ──────────────────────────────────────────
+
+type entityStateBatchEngine struct{ fakeEngine }
+
+func (e *entityStateBatchEngine) SetEntityStateBatch(_ context.Context, ops []engine.EntityStateOp) []error {
+	return make([]error, len(ops)) // all succeed
+}
+
+type entityStateBatchPartialErrEngine struct{ fakeEngine }
+
+func (e *entityStateBatchPartialErrEngine) SetEntityStateBatch(_ context.Context, ops []engine.EntityStateOp) []error {
+	errs := make([]error, len(ops))
+	if len(ops) > 0 {
+		errs[0] = fmt.Errorf("entity %q not found", ops[0].EntityName)
+	}
+	return errs
+}
+
+func TestHandleEntityStateBatch_HappyPath(t *testing.T) {
+	srv := newTestServerWith(&entityStateBatchEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_entity_state_batch","arguments":{"vault":"default","operations":[{"entity_name":"PostgreSQL","state":"deprecated"},{"entity_name":"Modbus","state":"active","type":"protocol"}]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	content := extractInnerJSON(t, resp)
+	results, ok := content["results"].([]any)
+	if !ok || len(results) != 2 {
+		t.Fatalf("expected 2 results, got %v", content["results"])
+	}
+	if total, _ := content["total"].(float64); int(total) != 2 {
+		t.Errorf("total = %v, want 2", content["total"])
+	}
+	for i, r := range results {
+		item := r.(map[string]any)
+		if item["status"] != "ok" {
+			t.Errorf("results[%d].status = %v, want ok", i, item["status"])
+		}
+	}
+}
+
+func TestHandleEntityStateBatch_PartialFailure(t *testing.T) {
+	srv := newTestServerWith(&entityStateBatchPartialErrEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_entity_state_batch","arguments":{"vault":"default","operations":[{"entity_name":"ghost","state":"deprecated"},{"entity_name":"Modbus","state":"deprecated"}]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected top-level error: %v", resp.Error)
+	}
+	content := extractInnerJSON(t, resp)
+	results, _ := content["results"].([]any)
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	first := results[0].(map[string]any)
+	if first["status"] != "error" {
+		t.Errorf("results[0].status = %v, want error", first["status"])
+	}
+	second := results[1].(map[string]any)
+	if second["status"] != "ok" {
+		t.Errorf("results[1].status = %v, want ok", second["status"])
+	}
+}
+
+func TestHandleEntityStateBatch_EmptyOperations(t *testing.T) {
+	srv := newTestServerWith(&entityStateBatchEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_entity_state_batch","arguments":{"vault":"default","operations":[]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil || resp.Error.Code != -32602 {
+		t.Errorf("expected -32602 for empty operations, got %v", resp.Error)
+	}
+}
+
+func TestHandleEntityStateBatch_ExceedsMax(t *testing.T) {
+	ops := make([]map[string]any, 51)
+	for i := range ops {
+		ops[i] = map[string]any{"entity_name": fmt.Sprintf("entity%d", i), "state": "deprecated"}
+	}
+	bodyBytes, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "method": "tools/call", "id": 1,
+		"params": map[string]any{
+			"name": "muninn_entity_state_batch",
+			"arguments": map[string]any{
+				"vault": "default", "operations": ops,
+			},
+		},
+	})
+	srv := newTestServerWith(&entityStateBatchEngine{})
+	w := postRPC(t, srv, string(bodyBytes))
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil || resp.Error.Code != -32602 {
+		t.Errorf("expected -32602 for >50 operations, got %v", resp.Error)
+	}
+}
+
+func TestHandleEntityStateBatch_InvalidState(t *testing.T) {
+	srv := newTestServerWith(&entityStateBatchEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_entity_state_batch","arguments":{"vault":"default","operations":[{"entity_name":"Modbus","state":"invalid_state"}]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil || resp.Error.Code != -32602 {
+		t.Errorf("expected -32602 for invalid state, got %v", resp.Error)
+	}
+}
+
+func TestHandleEntityStateBatch_MergedWithoutMergedInto(t *testing.T) {
+	srv := newTestServerWith(&entityStateBatchEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_entity_state_batch","arguments":{"vault":"default","operations":[{"entity_name":"Postgres","state":"merged"}]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil || resp.Error.Code != -32602 {
+		t.Errorf("expected -32602 for merged without merged_into, got %v", resp.Error)
+	}
+	if resp.Error != nil && !strings.Contains(resp.Error.Message, "merged_into") {
+		t.Errorf("expected error to mention merged_into, got: %q", resp.Error.Message)
+	}
+}
+
+func TestHandleEntityStateBatch_MissingEntityName(t *testing.T) {
+	srv := newTestServerWith(&entityStateBatchEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_entity_state_batch","arguments":{"vault":"default","operations":[{"state":"deprecated"}]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil || resp.Error.Code != -32602 {
+		t.Errorf("expected -32602 for missing entity_name, got %v", resp.Error)
 	}
 }
 
@@ -2239,6 +2549,55 @@ func (e *replayEnrichEngine) ReplayEnrichment(_ context.Context, _ string, _ []s
 	return &engine.ReplayEnrichmentResult{Processed: 5, Skipped: 2, StagesRun: []string{"entities", "relationships", "classification", "summary"}, DryRun: dryRun}, nil
 }
 
+type enrichmentCandidatesEngine struct {
+	fakeEngine
+	result *EnrichmentCandidatesResult
+	err    error
+}
+
+func (e *enrichmentCandidatesEngine) GetEnrichmentCandidates(_ context.Context, _ string, _ []string, _ string, _ int) (*EnrichmentCandidatesResult, error) {
+	if e.err != nil {
+		return nil, e.err
+	}
+	if e.result != nil {
+		return e.result, nil
+	}
+	return &EnrichmentCandidatesResult{
+		Items: []EnrichmentCandidate{{
+			ID:            "01HVTESTCANDIDATE0000000001",
+			Concept:       "candidate",
+			Content:       "candidate content",
+			MissingStages: []string{"summary"},
+			UpdatedAt:     "2026-03-29T12:00:00Z",
+			DigestFlags:   map[string]bool{"summary": false},
+		}},
+		StagesRequested: []string{"summary"},
+		Count:           1,
+	}, nil
+}
+
+type applyEnrichmentEngine struct {
+	fakeEngine
+	result *ApplyEnrichmentResult
+	err    error
+}
+
+func (e *applyEnrichmentEngine) ApplyEnrichment(_ context.Context, _ string, _ *ApplyEnrichmentRequest) (*ApplyEnrichmentResult, error) {
+	if e.err != nil {
+		return nil, e.err
+	}
+	if e.result != nil {
+		return e.result, nil
+	}
+	return &ApplyEnrichmentResult{
+		ID:            "01HVTESTAPPLY00000000000001",
+		AppliedStages: []string{"summary"},
+		UpdatedAt:     "2026-03-29T12:01:00Z",
+		DigestFlags:   map[string]bool{"summary": true},
+		Status:        "updated",
+	}, nil
+}
+
 func TestHandleReplayEnrichment_HappyPath(t *testing.T) {
 	srv := newTestServerWith(&replayEnrichEngine{})
 	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_replay_enrichment","arguments":{"vault":"default"}}}`
@@ -2271,19 +2630,33 @@ func TestHandleReplayEnrichment_HappyPath(t *testing.T) {
 }
 
 func TestHandleReplayEnrichment_MissingVault(t *testing.T) {
-	// When vault arg is empty string, resolveVault falls back to "default" (no error).
-	// Verify the handler succeeds with the default vault injection.
+	// When vault arg is absent entirely, resolveVault falls back to "default" (no error).
+	// An explicitly empty vault string is now rejected (fail-closed).
 	srv := newTestServerWith(&replayEnrichEngine{})
-	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_replay_enrichment","arguments":{"vault":""}}}`
+	// Omit vault arg entirely — should fall back to "default".
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_replay_enrichment","arguments":{}}}`
 	w := postRPC(t, srv, body)
 	resp := decodeResp(t, w.Body.String())
-	// resolveVault injects "default" when vault arg is absent or empty — no error expected.
 	if resp.Error != nil {
 		t.Errorf("expected success with default vault injection, got error: %v", resp.Error)
 	}
 	inner := extractInnerJSON(t, resp)
 	if _, ok := inner["processed"]; !ok {
 		t.Error("response missing 'processed' field")
+	}
+}
+
+func TestHandleReplayEnrichment_EmptyVaultString_Rejected(t *testing.T) {
+	// An explicitly empty vault string is now rejected (fail-closed).
+	srv := newTestServerWith(&replayEnrichEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_replay_enrichment","arguments":{"vault":""}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for empty vault string")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("expected -32602, got %d", resp.Error.Code)
 	}
 }
 
@@ -2344,6 +2717,149 @@ func TestHandleReplayEnrichment_WithStages(t *testing.T) {
 	}
 }
 
+func TestHandleGetEnrichmentCandidates_HappyPath(t *testing.T) {
+	srv := newTestServerWith(&enrichmentCandidatesEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_get_enrichment_candidates","arguments":{"vault":"default","stages":["summary"]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	inner := extractInnerJSON(t, resp)
+
+	items, ok := inner["items"].([]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("expected one candidate item, got %v", inner["items"])
+	}
+	if inner["count"] == nil {
+		t.Error("response missing 'count' field")
+	}
+	if inner["stages_requested"] == nil {
+		t.Error("response missing 'stages_requested' field")
+	}
+}
+
+func TestHandleGetEnrichmentCandidates_InvalidStages(t *testing.T) {
+	srv := newTestServerWith(&enrichmentCandidatesEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_get_enrichment_candidates","arguments":{"vault":"default","stages":"summary"}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected invalid params error")
+	}
+	if resp.Error.Code != -32602 {
+		t.Fatalf("expected -32602, got %d", resp.Error.Code)
+	}
+}
+
+type enrichmentCandidatesCursorCapture struct {
+	fakeEngine
+	cursor *string
+}
+
+func (e *enrichmentCandidatesCursorCapture) GetEnrichmentCandidates(_ context.Context, _ string, _ []string, afterCursor string, _ int) (*EnrichmentCandidatesResult, error) {
+	*e.cursor = afterCursor
+	return &EnrichmentCandidatesResult{Items: []EnrichmentCandidate{}, StagesRequested: []string{}, Count: 0}, nil
+}
+
+func TestHandleGetEnrichmentCandidates_CursorPassedThrough(t *testing.T) {
+	capturedCursor := ""
+	eng := &enrichmentCandidatesCursorCapture{cursor: &capturedCursor}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_get_enrichment_candidates","arguments":{"vault":"default","cursor":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: code=%d msg=%s", resp.Error.Code, resp.Error.Message)
+	}
+	if capturedCursor != "01ARZ3NDEKTSV4RRFFQ69G5FAV" {
+		t.Errorf("cursor: got %q, want %q", capturedCursor, "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+	}
+}
+
+func TestHandleGetEnrichmentCandidates_NextCursorInResponse(t *testing.T) {
+	eng := &enrichmentCandidatesEngine{result: &EnrichmentCandidatesResult{
+		Items:           []EnrichmentCandidate{},
+		StagesRequested: []string{"entities"},
+		Count:           0,
+		NextCursor:      "01HN5BQZ00000000000000001",
+	}}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_get_enrichment_candidates","arguments":{"vault":"default"}}}`
+	w := postRPC(t, srv, body)
+	inner := extractInnerJSON(t, decodeResp(t, w.Body.String()))
+	if got, _ := inner["next_cursor"].(string); got != "01HN5BQZ00000000000000001" {
+		t.Errorf("next_cursor: got %q, want %q", got, "01HN5BQZ00000000000000001")
+	}
+}
+
+func TestHandleGetEnrichmentCandidates_InvalidCursor(t *testing.T) {
+	srv := newTestServerWith(&enrichmentCandidatesEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_get_enrichment_candidates","arguments":{"vault":"default","cursor":"not-a-valid-ulid"}}}`
+	w := postRPC(t, srv, body)
+	if w.Code != 200 {
+		t.Fatalf("status: %d", w.Code)
+	}
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error response for invalid cursor")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code: got %d, want -32602", resp.Error.Code)
+	}
+}
+
+func TestHandleApplyEnrichment_HappyPath(t *testing.T) {
+	srv := newTestServerWith(&applyEnrichmentEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_apply_enrichment","arguments":{"vault":"default","id":"01HVTESTAPPLY00000000000001","expected_updated_at":"2026-03-29T12:00:00Z","summary":"new summary","stages_completed":["summary"],"entities":[{"name":"PostgreSQL","type":"database","confidence":0.9}],"relationships":[{"from_entity":"PostgreSQL","to_entity":"System of Record","rel_type":"is_a","weight":0.8}]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	inner := extractInnerJSON(t, resp)
+
+	if got, _ := inner["status"].(string); got != "updated" {
+		t.Fatalf("status: got %q, want %q", got, "updated")
+	}
+	if inner["applied_stages"] == nil {
+		t.Error("response missing 'applied_stages' field")
+	}
+}
+
+func TestHandleApplyEnrichment_MissingExpectedUpdatedAt(t *testing.T) {
+	srv := newTestServerWith(&applyEnrichmentEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_apply_enrichment","arguments":{"vault":"default","id":"01HVTESTAPPLY00000000000001"}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected invalid params error")
+	}
+	if resp.Error.Code != -32602 {
+		t.Fatalf("expected -32602, got %d", resp.Error.Code)
+	}
+}
+
+func TestHandleApplyEnrichment_InvalidRelationshipPayload(t *testing.T) {
+	srv := newTestServerWith(&applyEnrichmentEngine{})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_apply_enrichment","arguments":{"vault":"default","id":"01HVTESTAPPLY00000000000001","expected_updated_at":"2026-03-29T12:00:00Z","relationships":[{"from_entity":"PostgreSQL","rel_type":"is_a"}]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected invalid params error")
+	}
+	if resp.Error.Code != -32602 {
+		t.Fatalf("expected -32602, got %d", resp.Error.Code)
+	}
+}
+
+func TestHandleApplyEnrichment_Conflict(t *testing.T) {
+	srv := newTestServerWith(&applyEnrichmentEngine{err: fmt.Errorf("%w: stale write", engine.ErrEnrichmentConflict)})
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_apply_enrichment","arguments":{"vault":"default","id":"01HVTESTAPPLY00000000000001","expected_updated_at":"2026-03-29T12:00:00Z","summary":"new summary"}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected conflict error")
+	}
+	if resp.Error.Code != -32009 {
+		t.Fatalf("expected -32009, got %d", resp.Error.Code)
+	}
+}
+
 // ── Issue #172: concept in muninn_remember / muninn_remember_batch response ──
 
 // TestHandleRemember_ConceptInResponse verifies that the concept sent in a
@@ -2390,5 +2906,654 @@ func TestHandleRememberBatch_ConceptInResponse(t *testing.T) {
 		if got != wantConcepts[i] {
 			t.Errorf("results[%d].concept = %q, want %q", i, got, wantConcepts[i])
 		}
+	}
+}
+
+// ── client-provided embedding tests ──────────────────────────────────────────
+
+// embeddingCapturingEngine records the last Write and Activate requests
+// so tests can assert that the embedding was forwarded correctly.
+type embeddingCapturingEngine struct {
+	fakeEngine
+	lastWrite    *mbp.WriteRequest
+	lastBatch    []*mbp.WriteRequest
+	lastActivate *mbp.ActivateRequest
+	vaultDim     int // 0 means "no existing vectors yet"
+}
+
+func (e *embeddingCapturingEngine) Write(_ context.Context, req *mbp.WriteRequest) (*mbp.WriteResponse, error) {
+	e.lastWrite = req
+	return &mbp.WriteResponse{ID: "embed-id"}, nil
+}
+
+func (e *embeddingCapturingEngine) WriteBatch(_ context.Context, reqs []*mbp.WriteRequest) ([]*mbp.WriteResponse, []error) {
+	e.lastBatch = reqs
+	resps := make([]*mbp.WriteResponse, len(reqs))
+	errs := make([]error, len(reqs))
+	for i := range reqs {
+		resps[i] = &mbp.WriteResponse{ID: fmt.Sprintf("embed-batch-%d", i)}
+	}
+	return resps, errs
+}
+
+func (e *embeddingCapturingEngine) Activate(_ context.Context, req *mbp.ActivateRequest) (*mbp.ActivateResponse, error) {
+	e.lastActivate = req
+	return &mbp.ActivateResponse{}, nil
+}
+
+func (e *embeddingCapturingEngine) GetVaultEmbedDim(_ context.Context, _ string) int {
+	return e.vaultDim
+}
+
+// ── muninn_remember embedding ────────────────────────────────────────────────
+
+func TestHandleRemember_EmbeddingForwarded(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_remember","arguments":{"vault":"default","content":"test","embedding":[0.1,0.2,0.3]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	if eng.lastWrite == nil {
+		t.Fatal("Write was not called")
+	}
+	if len(eng.lastWrite.Embedding) != 3 {
+		t.Fatalf("embedding length = %d, want 3", len(eng.lastWrite.Embedding))
+	}
+	if eng.lastWrite.Embedding[0] != float32(0.1) || eng.lastWrite.Embedding[1] != float32(0.2) || eng.lastWrite.Embedding[2] != float32(0.3) {
+		t.Errorf("embedding values incorrect: %v", eng.lastWrite.Embedding)
+	}
+}
+
+func TestHandleRemember_EmbeddingDimensionMismatch(t *testing.T) {
+	eng := &embeddingCapturingEngine{vaultDim: 3}
+	srv := newTestServerWith(eng)
+	// provide 4 floats but vault expects 3
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_remember","arguments":{"vault":"default","content":"test","embedding":[0.1,0.2,0.3,0.4]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for dimension mismatch, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+func TestHandleRemember_EmbeddingNonNumericElement(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_remember","arguments":{"vault":"default","content":"test","embedding":[0.1,"oops",0.3]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for non-numeric element, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+func TestHandleRemember_EmbeddingOversized(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	// Build an embedding of 4097 floats
+	floats := make([]string, 4097)
+	for i := range floats {
+		floats[i] = "0.1"
+	}
+	body := fmt.Sprintf(
+		`{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_remember","arguments":{"vault":"default","content":"test","embedding":[%s]}}}`,
+		strings.Join(floats, ","),
+	)
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for oversized embedding, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+func TestHandleRemember_EmbeddingOmittedIsAccepted(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_remember","arguments":{"vault":"default","content":"no embedding here"}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	if eng.lastWrite != nil && len(eng.lastWrite.Embedding) != 0 {
+		t.Errorf("expected no embedding forwarded, got %d elements", len(eng.lastWrite.Embedding))
+	}
+}
+
+func TestHandleRemember_EmbeddingEmptyVaultDimAccepted(t *testing.T) {
+	// vaultDim=0 means no vectors yet; any dimension should be accepted
+	eng := &embeddingCapturingEngine{vaultDim: 0}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_remember","arguments":{"vault":"default","content":"test","embedding":[0.1,0.2,0.3,0.4,0.5]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error (empty vault should accept any dim): %v", resp.Error)
+	}
+}
+
+// ── muninn_remember_batch embedding ──────────────────────────────────────────
+
+func TestHandleRememberBatch_EmbeddingForwarded(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_remember_batch","arguments":{"vault":"default","memories":[{"content":"m1","embedding":[0.1,0.2]},{"content":"m2"}]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	if len(eng.lastBatch) != 2 {
+		t.Fatalf("batch length = %d, want 2", len(eng.lastBatch))
+	}
+	if len(eng.lastBatch[0].Embedding) != 2 {
+		t.Errorf("batch[0] embedding length = %d, want 2", len(eng.lastBatch[0].Embedding))
+	}
+	if len(eng.lastBatch[1].Embedding) != 0 {
+		t.Errorf("batch[1] should have no embedding, got %d", len(eng.lastBatch[1].Embedding))
+	}
+}
+
+func TestHandleRememberBatch_EmbeddingDimensionMismatch(t *testing.T) {
+	eng := &embeddingCapturingEngine{vaultDim: 2}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_remember_batch","arguments":{"vault":"default","memories":[{"content":"m1","embedding":[0.1,0.2,0.3]}]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for dimension mismatch, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+func TestHandleRememberBatch_EmbeddingNonNumericElement(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_remember_batch","arguments":{"vault":"default","memories":[{"content":"m1","embedding":[0.1,"bad"]}]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for non-numeric element, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+func TestHandleRememberBatch_EmbeddingOversized(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	floats := make([]string, 4097)
+	for i := range floats {
+		floats[i] = "0.1"
+	}
+	body := fmt.Sprintf(
+		`{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_remember_batch","arguments":{"vault":"default","memories":[{"content":"m1","embedding":[%s]}]}}}`,
+		strings.Join(floats, ","),
+	)
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for oversized embedding, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+// ── muninn_recall embedding ───────────────────────────────────────────────────
+
+func TestHandleRecall_EmbeddingForwarded(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_recall","arguments":{"vault":"default","context":["test"],"embedding":[0.5,0.6,0.7]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	if eng.lastActivate == nil {
+		t.Fatal("Activate was not called")
+	}
+	if len(eng.lastActivate.Embedding) != 3 {
+		t.Fatalf("embedding length = %d, want 3", len(eng.lastActivate.Embedding))
+	}
+}
+
+func TestHandleRecall_EmbeddingDimensionMismatch(t *testing.T) {
+	eng := &embeddingCapturingEngine{vaultDim: 3}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_recall","arguments":{"vault":"default","context":["test"],"embedding":[0.1,0.2,0.3,0.4]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for dimension mismatch, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+func TestHandleRecall_EmbeddingNonNumericElement(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_recall","arguments":{"vault":"default","context":["test"],"embedding":[0.1,true,0.3]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for non-numeric element, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+func TestHandleRecall_EmbeddingOversized(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	floats := make([]string, 4097)
+	for i := range floats {
+		floats[i] = "0.1"
+	}
+	body := fmt.Sprintf(
+		`{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_recall","arguments":{"vault":"default","context":["test"],"embedding":[%s]}}}`,
+		strings.Join(floats, ","),
+	)
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for oversized embedding, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+func TestHandleRecall_EmbeddingOmittedIsAccepted(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_recall","arguments":{"vault":"default","context":["no embedding"]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	if eng.lastActivate != nil && len(eng.lastActivate.Embedding) != 0 {
+		t.Errorf("expected no embedding forwarded, got %d elements", len(eng.lastActivate.Embedding))
+	}
+}
+
+// ── muninn_evolve embedding ───────────────────────────────────────────────────
+
+func TestHandleEvolve_EmbeddingForwarded(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_evolve","arguments":{"vault":"default","id":"01JTEST","new_content":"updated","reason":"fixing","embedding":[0.1,0.2,0.3]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+}
+
+func TestHandleEvolve_EmbeddingDimensionMismatch(t *testing.T) {
+	eng := &embeddingCapturingEngine{vaultDim: 3}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_evolve","arguments":{"vault":"default","id":"01JTEST","new_content":"updated","reason":"fixing","embedding":[0.1,0.2,0.3,0.4]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for dimension mismatch, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+func TestHandleEvolve_EmbeddingNonNumericElement(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_evolve","arguments":{"vault":"default","id":"01JTEST","new_content":"updated","reason":"fixing","embedding":[0.1,"bad",0.3]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for non-numeric element, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+func TestHandleEvolve_EmbeddingOversized(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	floats := make([]string, 4097)
+	for i := range floats {
+		floats[i] = "0.1"
+	}
+	body := fmt.Sprintf(
+		`{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_evolve","arguments":{"vault":"default","id":"01JTEST","new_content":"updated","reason":"fixing","embedding":[%s]}}}`,
+		strings.Join(floats, ","),
+	)
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for oversized embedding, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+// ── muninn_explain embedding ─────────────────────────────────────────────────
+
+func TestHandleExplain_EmbeddingAccepted(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_explain","arguments":{"vault":"default","engram_id":"01JTEST","query":["test"],"embedding":[0.1,0.2,0.3]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+}
+
+func TestHandleExplain_EmbeddingDimensionMismatch(t *testing.T) {
+	eng := &embeddingCapturingEngine{vaultDim: 3}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_explain","arguments":{"vault":"default","engram_id":"01JTEST","query":["test"],"embedding":[0.1,0.2,0.3,0.4]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for dimension mismatch, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+func TestHandleExplain_EmbeddingNonNumericElement(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_explain","arguments":{"vault":"default","engram_id":"01JTEST","query":["test"],"embedding":[0.1,"bad"]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for non-numeric element, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+func TestHandleExplain_EmbeddingOversized(t *testing.T) {
+	eng := &embeddingCapturingEngine{}
+	srv := newTestServerWith(eng)
+	floats := make([]string, 4097)
+	for i := range floats {
+		floats[i] = "0.1"
+	}
+	body := fmt.Sprintf(
+		`{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_explain","arguments":{"vault":"default","engram_id":"01JTEST","query":["test"],"embedding":[%s]}}}`,
+		strings.Join(floats, ","),
+	)
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for oversized embedding, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+// ── muninn_add_child embedding ────────────────────────────────────────────────
+
+type addChildCapturingEngine struct {
+	fakeEngine
+	lastChild *AddChildRequest
+	vaultDim  int
+}
+
+func (e *addChildCapturingEngine) AddChild(_ context.Context, _, _ string, child *AddChildRequest) (*AddChildResult, error) {
+	e.lastChild = child
+	return &AddChildResult{ChildID: "child-id", Ordinal: 1}, nil
+}
+
+func (e *addChildCapturingEngine) GetVaultEmbedDim(_ context.Context, _ string) int {
+	return e.vaultDim
+}
+
+func TestHandleAddChild_EmbeddingForwarded(t *testing.T) {
+	eng := &addChildCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_add_child","arguments":{"vault":"default","parent_id":"01JPARENT","concept":"child","content":"content","embedding":[0.1,0.2,0.3]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	if eng.lastChild == nil {
+		t.Fatal("AddChild was not called")
+	}
+	if len(eng.lastChild.Embedding) != 3 {
+		t.Errorf("embedding length = %d, want 3", len(eng.lastChild.Embedding))
+	}
+}
+
+func TestHandleAddChild_EmbeddingDimensionMismatch(t *testing.T) {
+	eng := &addChildCapturingEngine{vaultDim: 3}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_add_child","arguments":{"vault":"default","parent_id":"01JPARENT","concept":"child","content":"content","embedding":[0.1,0.2,0.3,0.4]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for dimension mismatch, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+func TestHandleAddChild_EmbeddingNonNumericElement(t *testing.T) {
+	eng := &addChildCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_add_child","arguments":{"vault":"default","parent_id":"01JPARENT","concept":"child","content":"content","embedding":[0.1,"bad"]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for non-numeric element, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+func TestHandleAddChild_EmbeddingOversized(t *testing.T) {
+	eng := &addChildCapturingEngine{}
+	srv := newTestServerWith(eng)
+	floats := make([]string, 4097)
+	for i := range floats {
+		floats[i] = "0.1"
+	}
+	body := fmt.Sprintf(
+		`{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_add_child","arguments":{"vault":"default","parent_id":"01JPARENT","concept":"child","content":"content","embedding":[%s]}}}`,
+		strings.Join(floats, ","),
+	)
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil {
+		t.Fatal("expected error for oversized embedding, got nil")
+	}
+	if resp.Error.Code != -32602 {
+		t.Errorf("error code = %d, want -32602", resp.Error.Code)
+	}
+}
+
+func TestHandleAddChild_EmbeddingOmittedIsAccepted(t *testing.T) {
+	eng := &addChildCapturingEngine{}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_add_child","arguments":{"vault":"default","parent_id":"01JPARENT","concept":"child","content":"content"}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	if eng.lastChild != nil && len(eng.lastChild.Embedding) != 0 {
+		t.Errorf("expected no embedding, got %d elements", len(eng.lastChild.Embedding))
+	}
+}
+
+// ── muninn_trust ─────────────────────────────────────────────────────────────
+
+func TestHandleSetTrust(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		srv := newTestServer()
+		body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_trust","arguments":{"vault":"default","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","trust":"verified"}}}`
+		w := postRPC(t, srv, body)
+		resp := decodeResp(t, w.Body.String())
+		if resp.Error != nil {
+			t.Fatalf("unexpected error: %v", resp.Error)
+		}
+		inner := extractInnerJSON(t, resp)
+		if ok, _ := inner["ok"].(bool); !ok {
+			t.Errorf("expected ok=true in response, got %v", inner["ok"])
+		}
+	})
+
+	t.Run("missing id", func(t *testing.T) {
+		srv := newTestServer()
+		body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_trust","arguments":{"vault":"default","trust":"verified"}}}`
+		w := postRPC(t, srv, body)
+		resp := decodeResp(t, w.Body.String())
+		if resp.Error == nil || resp.Error.Code != -32602 {
+			t.Errorf("expected -32602 for missing id, got %v", resp.Error)
+		}
+	})
+
+	t.Run("missing trust", func(t *testing.T) {
+		srv := newTestServer()
+		body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_trust","arguments":{"vault":"default","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}}}`
+		w := postRPC(t, srv, body)
+		resp := decodeResp(t, w.Body.String())
+		if resp.Error == nil || resp.Error.Code != -32602 {
+			t.Errorf("expected -32602 for missing trust, got %v", resp.Error)
+		}
+	})
+
+	t.Run("invalid trust level", func(t *testing.T) {
+		srv := newTestServer()
+		body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_trust","arguments":{"vault":"default","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","trust":"bogus"}}}`
+		w := postRPC(t, srv, body)
+		resp := decodeResp(t, w.Body.String())
+		if resp.Error == nil || resp.Error.Code != -32602 {
+			t.Errorf("expected -32602 for invalid trust level, got %v", resp.Error)
+		}
+	})
+}
+
+// ── muninn_recall annotate ───────────────────────────────────────────────────
+
+// recallAnnotateEngine is a test double for annotation tests.
+type recallAnnotateEngine struct {
+	fakeEngine
+	annData *engine.AnnotationData
+}
+
+func (e *recallAnnotateEngine) Activate(_ context.Context, _ *mbp.ActivateRequest) (*mbp.ActivateResponse, error) {
+	return &mbp.ActivateResponse{
+		Activations: []mbp.ActivationItem{{
+			ID:         "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+			Concept:    "test",
+			Content:    "content",
+			Score:      0.9,
+			LastAccess: time.Now().Add(-45 * 24 * time.Hour).UnixNano(), // 45 days ago → stale
+		}},
+	}, nil
+}
+
+func (e *recallAnnotateEngine) GetAnnotations(_ context.Context, _, _ string) (*engine.AnnotationData, error) {
+	return e.annData, nil
+}
+
+func TestHandleRecall_Annotate(t *testing.T) {
+	conflictID := "01HHHHHHHHHHHHHHHHHHHHHHHA"
+	supersederID := "01HHHHHHHHHHHHHHHHHHHHHHHB"
+	lastVerified := time.Date(2026, 1, 15, 10, 30, 0, 0, time.UTC)
+
+	eng := &recallAnnotateEngine{
+		annData: &engine.AnnotationData{
+			ConflictsWith: []string{conflictID},
+			SupersededBy:  supersederID,
+			LastVerified:  &lastVerified,
+		},
+	}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_recall","arguments":{"context":["test"],"annotate":true}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	outer := extractInnerJSON(t, resp)
+
+	mems, ok := outer["memories"].([]interface{})
+	if !ok || len(mems) == 0 {
+		t.Fatalf("expected memories array, got %v", outer["memories"])
+	}
+	mem0 := mems[0].(map[string]interface{})
+	ann, ok := mem0["annotations"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected annotations object, got %T: %v", mem0["annotations"], mem0["annotations"])
+	}
+
+	if stale, _ := ann["stale"].(bool); !stale {
+		t.Errorf("stale should be true for 45-day-old engram, got %v", ann["stale"])
+	}
+	staleDays, _ := ann["stale_days"].(float64)
+	if staleDays < 44 || staleDays > 46 {
+		t.Errorf("stale_days = %v, want ~45", staleDays)
+	}
+	conflicts, _ := ann["conflicts_with"].([]interface{})
+	if len(conflicts) != 1 || conflicts[0].(string) != conflictID {
+		t.Errorf("conflicts_with = %v, want [%s]", conflicts, conflictID)
+	}
+	if sup, _ := ann["superseded_by"].(string); sup != supersederID {
+		t.Errorf("superseded_by = %q, want %q", sup, supersederID)
+	}
+	if lv, _ := ann["last_verified"].(string); lv != "2026-01-15T10:30:00Z" {
+		t.Errorf("last_verified = %q, want 2026-01-15T10:30:00Z", lv)
+	}
+}
+
+func TestHandleRecall_AnnotateFalse_NoAnnotations(t *testing.T) {
+	// Without annotate=true, annotations must be absent even if GetAnnotations would return data.
+	eng := &recallAnnotateEngine{
+		annData: &engine.AnnotationData{ConflictsWith: []string{"01ARZ3NDEKTSV4RRFFQ69G5FAV"}},
+	}
+	srv := newTestServerWith(eng)
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_recall","arguments":{"context":["test"]}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	outer := extractInnerJSON(t, resp)
+
+	mems, ok := outer["memories"].([]interface{})
+	if !ok || len(mems) == 0 {
+		t.Fatalf("expected memories array, got %v", outer["memories"])
+	}
+	mem0 := mems[0].(map[string]interface{})
+	if _, hasAnn := mem0["annotations"]; hasAnn {
+		t.Error("annotations should be absent when annotate=false (or not set)")
 	}
 }

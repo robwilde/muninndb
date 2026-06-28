@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 	"unicode"
@@ -127,6 +130,10 @@ func (s *Server) handleCreateAPIKey(authStore *auth.Store) http.HandlerFunc {
 			"token": token, // shown once
 			"key":   key,
 		})
+		s.EmitAudit(r, "api_key.create", "api_key", key.ID, "ok", map[string]string{
+			"label": req.Label,
+			"vault": req.Vault,
+		})
 	}
 }
 
@@ -216,6 +223,7 @@ func (s *Server) handleRevokeAPIKey(authStore *auth.Store) http.HandlerFunc {
 			return
 		}
 		s.sendJSON(w, http.StatusOK, map[string]interface{}{"revoked": id})
+		s.EmitAudit(r, "api_key.revoke", "api_key", id, "ok", nil)
 	}
 }
 
@@ -230,7 +238,11 @@ func (s *Server) handleChangeAdminPassword(authStore *auth.Store) http.HandlerFu
 			return
 		}
 		if req.NewPassword == "" {
-			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "new_password is required")
+			s.sendError(r, w, http.StatusBadRequest, ErrAuthFailed, "new_password is required")
+			return
+		}
+		if len(req.NewPassword) < 8 {
+			s.sendError(r, w, http.StatusBadRequest, ErrAuthFailed, "new_password must be at least 8 characters")
 			return
 		}
 		if err := authStore.ChangeAdminPassword(req.Username, req.NewPassword); err != nil {
@@ -238,6 +250,7 @@ func (s *Server) handleChangeAdminPassword(authStore *auth.Store) http.HandlerFu
 			return
 		}
 		s.sendJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		s.EmitAudit(r, "admin.password_change", "admin", req.Username, "ok", nil)
 	}
 }
 
@@ -277,6 +290,7 @@ func (s *Server) handleSetVaultConfig(authStore *auth.Store) http.HandlerFunc {
 			return
 		}
 		s.sendJSON(w, http.StatusOK, cfg)
+		s.EmitAudit(r, "vault.config_update", "vault", cfg.Name, "ok", nil)
 	}
 }
 
@@ -411,6 +425,7 @@ func (s *Server) handlePutVaultPlasticity(as *auth.Store) http.HandlerFunc {
 			"config":   &cfg,
 			"resolved": resolved,
 		})
+		s.EmitAudit(r, "vault.plasticity_update", "vault", name, "ok", nil)
 	}
 }
 
@@ -424,24 +439,54 @@ type MCPInfoResponse struct {
 
 // handleMCPInfo returns the MCP endpoint URL and token status for the Connect UI.
 func (s *Server) handleMCPInfo(w http.ResponseWriter, r *http.Request) {
-	var mcpURL string
+	// Fork-level explicit external MCP URL override.
 	if s.mcpExternalURL != "" {
-		mcpURL = s.mcpExternalURL
-	} else {
-		addr := s.mcpAddr
-		if addr == "" {
-			addr = ":8750"
-		}
-		host, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			host = "127.0.0.1"
-			port = "8750"
-		}
-		if host == "" || host == "0.0.0.0" || host == "::" {
-			host = "127.0.0.1"
-		}
-		mcpURL = "http://" + host + ":" + port + "/mcp"
+		s.sendJSON(w, http.StatusOK, MCPInfoResponse{
+			URL:             s.mcpExternalURL,
+			TokenConfigured: s.mcpHasToken,
+		})
+		return
 	}
+	// MUNINN_MCP_URL lets operators advertise the externally-reachable MCP URL
+	// (e.g. in Docker or remote deployments where the listen address is not the
+	// same as the address clients should connect to).
+	if override := os.Getenv("MUNINN_MCP_URL"); override != "" {
+		if u, err := url.ParseRequestURI(override); err == nil && u.Host != "" {
+			s.sendJSON(w, http.StatusOK, MCPInfoResponse{
+				URL:             override,
+				TokenConfigured: s.mcpHasToken,
+			})
+			return
+		}
+		slog.Warn("MUNINN_MCP_URL is set but not a valid URL, falling back to derived address", "value", override)
+	}
+
+	addr := s.mcpAddr
+	if addr == "" {
+		addr = ":8750"
+	}
+	// Use net.SplitHostPort to correctly handle all valid net.Listen address forms:
+	// bare ":port", "0.0.0.0:port", "host:port", and IPv6 bracket notation "[::1]:port".
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Fallback for misconfigured or empty addresses.
+		host = "127.0.0.1"
+		port = "8750"
+	}
+	// A wildcard listen address (empty string, 0.0.0.0, or ::) means the server
+	// is reachable on any interface; use 127.0.0.1 to avoid IPv6 dual-stack ambiguity.
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	// Reflect the scheme the daemon actually serves. s.tlsConfig is non-nil iff
+	// client-facing TLS is enabled (it's what Serve wraps the listener with) and
+	// is more reliable than r.TLS here, which is nil when this endpoint is reached
+	// over loopback behind the UI reverse-proxy.
+	scheme := "http"
+	if s.tlsConfig != nil {
+		scheme = "https"
+	}
+	mcpURL := scheme + "://" + host + ":" + port + "/mcp"
 	s.sendJSON(w, http.StatusOK, MCPInfoResponse{
 		URL:             mcpURL,
 		TokenConfigured: s.mcpHasToken,
@@ -495,26 +540,43 @@ type EmbedStatusResponse struct {
 	EmbeddedCount int64  `json:"embedded_count"` // -1 = unknown
 	TotalCount    int64  `json:"total_count"`    // -1 = unknown
 	Indexing      bool   `json:"indexing"`
+	// RatePerSec is the current embedding rate in engrams per second; 0 when not indexing.
+	RatePerSec float64 `json:"rate_per_sec"`
+	// ETASeconds is the estimated seconds until indexing completes; 0 when not indexing or rate unknown.
+	ETASeconds int64 `json:"eta_seconds"`
+	// HardwareAccelerated is nil for cloud providers; true/false for Ollama (GPU vs CPU).
+	HardwareAccelerated *bool `json:"hardware_accelerated,omitempty"`
 }
 
 // handleEmbedStatus returns the current embedder configuration and indexing state.
 func (s *Server) handleEmbedStatus(w http.ResponseWriter, r *http.Request) {
-	resp, err := s.engine.Stat(r.Context(), &StatRequest{})
+	statResp, err := s.engine.Stat(r.Context(), &StatRequest{})
 	totalCount := int64(-1)
 	if err == nil {
-		totalCount = int64(resp.EngramCount)
+		totalCount = int64(statResp.EngramCount)
 	}
 
 	embeddedCount := s.engine.CountEmbedded(r.Context())
+	indexing := embeddedCount >= 0 && totalCount >= 0 && embeddedCount < totalCount
 
-	s.sendJSON(w, http.StatusOK, EmbedStatusResponse{
-		Provider:      s.embedProvider,
-		Model:         s.embedModel,
-		Enabled:       s.embedProvider != "" && s.embedProvider != "none",
-		EmbeddedCount: embeddedCount,
-		TotalCount:    totalCount,
-		Indexing:      embeddedCount >= 0 && totalCount >= 0 && embeddedCount < totalCount,
-	})
+	resp := EmbedStatusResponse{
+		Provider:            s.embedProvider,
+		Model:               s.embedModel,
+		Enabled:             s.embedProvider != "" && s.embedProvider != "none",
+		EmbeddedCount:       embeddedCount,
+		TotalCount:          totalCount,
+		Indexing:            indexing,
+		HardwareAccelerated: s.embedHardwareAccelerated,
+	}
+
+	// Only populate rate/ETA when actively indexing.
+	if indexing {
+		stats := s.engine.EmbedStats()
+		resp.RatePerSec = stats.RatePerSec
+		resp.ETASeconds = stats.ETASeconds
+	}
+
+	s.sendJSON(w, http.StatusOK, resp)
 }
 
 // PluginStatusResponse is one entry in GET /api/admin/plugins.
@@ -567,7 +629,27 @@ func (s *Server) handleGetPluginConfig(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, "failed to load plugin config: "+err.Error())
 		return
 	}
+	// Never return provider API keys in cleartext — the admin UI only needs to
+	// confirm which key is set, not read it back.
+	cfg.EmbedAPIKey = maskSecret(cfg.EmbedAPIKey)
+	cfg.EnrichAPIKey = maskSecret(cfg.EnrichAPIKey)
 	s.sendJSON(w, http.StatusOK, cfg)
+}
+
+// maskSecret returns a display-safe form of a secret: empty stays empty;
+// otherwise a fixed bullet prefix hides the value (and its length), with the
+// last four characters shown so an admin can tell which key is configured.
+// A real provider key never contains bullets, so the masked form is
+// unambiguous and the save path can detect "unchanged" by re-masking.
+func maskSecret(s string) string {
+	if s == "" {
+		return ""
+	}
+	const mask = "••••••••"
+	if len(s) <= 4 {
+		return mask
+	}
+	return mask + s[len(s)-4:]
 }
 
 // handlePutPluginConfig saves plugin configuration to disk.
@@ -582,11 +664,27 @@ func (s *Server) handlePutPluginConfig(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid request body: "+err.Error())
 		return
 	}
+	// Preserve any API key the client sent back unchanged — i.e. equal to the
+	// masked value GET returned — so the mask is never persisted as the real
+	// key. A retyped key won't match the mask and is saved as-is; an explicit
+	// empty value clears the key.
+	if existing, err := plugincfg.LoadPluginConfig(s.dataDir); err == nil {
+		if cfg.EmbedAPIKey == maskSecret(existing.EmbedAPIKey) {
+			cfg.EmbedAPIKey = existing.EmbedAPIKey
+		}
+		if cfg.EnrichAPIKey == maskSecret(existing.EnrichAPIKey) {
+			cfg.EnrichAPIKey = existing.EnrichAPIKey
+		}
+	}
 	if err := plugincfg.SavePluginConfig(s.dataDir, cfg); err != nil {
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, "failed to save plugin config: "+err.Error())
 		return
 	}
+	// Echo the saved config back masked so the response never carries cleartext.
+	cfg.EmbedAPIKey = maskSecret(cfg.EmbedAPIKey)
+	cfg.EnrichAPIKey = maskSecret(cfg.EnrichAPIKey)
 	s.sendJSON(w, http.StatusOK, cfg)
+	s.EmitAudit(r, "plugin.config_update", "plugin", "config", "ok", nil)
 }
 
 // handleRenameVault renames a vault (metadata-only, no engram data changes).
@@ -663,6 +761,7 @@ func (s *Server) handleRenameVault(w http.ResponseWriter, r *http.Request) {
 		"old_name": name,
 		"new_name": req.NewName,
 	})
+	s.EmitAudit(r, "vault.rename", "vault", name, "ok", map[string]string{"new_name": req.NewName})
 }
 
 // handleDeleteVault deletes a vault and all its data.
@@ -685,16 +784,38 @@ func (s *Server) handleDeleteVault(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.engine.DeleteVault(r.Context(), name); err != nil {
 		if errors.Is(err, engine.ErrVaultNotFound) {
+			// Vault may exist only in auth config (created via UI but no engrams written yet).
+			// Clean up the phantom vault so the UI can remove it cleanly.
+			if s.authStore != nil {
+				if cfgs, cfgErr := s.authStore.ListVaultConfigs(); cfgErr == nil {
+					for _, cfg := range cfgs {
+						if cfg.Name == name {
+							if delErr := s.authStore.DeleteVaultConfig(name); delErr != nil {
+								s.emitAuditErr(r, "vault.delete", "vault", name, delErr, nil)
+								s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, delErr.Error())
+								return
+							}
+							s.EmitAudit(r, "vault.delete", "vault", name, "ok", nil)
+							w.WriteHeader(http.StatusNoContent)
+							return
+						}
+					}
+				}
+			}
+			s.emitAuditErr(r, "vault.delete", "vault", name, err, nil)
 			s.sendError(r, w, http.StatusNotFound, ErrVaultNotFound, err.Error())
 			return
 		}
 		if errors.Is(err, engine.ErrVaultJobActive) {
+			s.emitAuditErr(r, "vault.delete", "vault", name, err, nil)
 			s.sendError(r, w, http.StatusConflict, ErrVaultForbidden, err.Error())
 			return
 		}
+		s.emitAuditErr(r, "vault.delete", "vault", name, err, nil)
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
+	s.EmitAudit(r, "vault.delete", "vault", name, "ok", nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -724,6 +845,7 @@ func (s *Server) handleClearVault(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
+	s.EmitAudit(r, "vault.clear", "vault", name, "ok", nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -765,6 +887,7 @@ func (s *Server) handleCloneVault(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
+	s.EmitAudit(r, "vault.clone", "vault", name, "ok", map[string]string{"new_name": req.NewName})
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"job_id": job.ID})
@@ -805,6 +928,7 @@ func (s *Server) handleMergeVault(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
+	s.EmitAudit(r, "vault.merge", "vault", source, "ok", map[string]string{"target": req.Target})
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"job_id": job.ID})
@@ -855,6 +979,7 @@ func (s *Server) handleExportVault(w http.ResponseWriter, r *http.Request) {
 		slog.Error("rest: export vault failed mid-stream; aborting connection", "vault", name, "err", err, "bytes_written", cw.n)
 		panic(http.ErrAbortHandler)
 	}
+	s.EmitAudit(r, "vault.export", "vault", name, "ok", nil)
 }
 
 // handleImportVault imports a .muninn archive into a new vault.
@@ -873,8 +998,14 @@ func (s *Server) handleImportVault(w http.ResponseWriter, r *http.Request) {
 	}
 	resetMeta := r.URL.Query().Get("reset_metadata") == "true"
 
-	job, err := s.engine.StartImport(r.Context(), vaultName, s.embedModel, 0, resetMeta, r.Body)
+	// Use a pipe so the request body can be streamed to the background import
+	// goroutine without racing against the HTTP server closing r.Body when this
+	// handler returns. The handler copies r.Body → pw synchronously, so it
+	// blocks until the entire upload is received before sending 202.
+	pr, pw := io.Pipe()
+	job, err := s.engine.StartImport(r.Context(), vaultName, s.embedModel, 0, resetMeta, pr)
 	if err != nil {
+		pw.CloseWithError(err)
 		if errors.Is(err, engine.ErrVaultNotFound) {
 			s.sendError(r, w, http.StatusNotFound, ErrVaultNotFound, err.Error())
 			return
@@ -886,6 +1017,17 @@ func (s *Server) handleImportVault(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
+
+	s.EmitAudit(r, "vault.import", "vault", vaultName, "ok", nil)
+
+	// Stream body into the pipe. The import goroutine reads from pr concurrently.
+	// This keeps r.Body alive for the duration of the upload.
+	if _, copyErr := io.Copy(pw, r.Body); copyErr != nil {
+		pw.CloseWithError(copyErr)
+	} else {
+		pw.Close()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"job_id": job.ID})
@@ -914,6 +1056,7 @@ func (s *Server) handleReindexFTSVault(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
+	s.EmitAudit(r, "vault.reindex", "vault", name, "ok", nil)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]any{
@@ -958,6 +1101,7 @@ func (s *Server) handleReembedVault(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
+	s.EmitAudit(r, "vault.reembed", "vault", name, "ok", map[string]string{"model": model})
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"job_id": job.ID})

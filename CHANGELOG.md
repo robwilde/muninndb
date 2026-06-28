@@ -9,13 +9,267 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.7.0] - 2026-06-12
+
+The headline of this release is a complete overhaul of the cluster subsystem.
+The Cortex/Lobe replication layer existed in previous releases but was not
+reliably functional in real multi-node deployments. Every known correctness
+issue has been addressed and Docker-validated end-to-end. High-availability
+deployments are now production-ready.
+
+### Added
+
+- **Automatic failover.** When the Cortex goes down, Lobes detect SDOWN via
+  gossip, accumulate votes, and the first node with quorum wins a jittered
+  Raft-style election. Failover completes without operator intervention. (#532)
+- **Returning-primary deference.** A restarted former Cortex probes the cluster
+  before asserting leadership. If a failover leader is already in place, it
+  defers, receives a snapshot, and follows — no split-brain, no data loss. (#537)
+- **PeerHello discovery mesh.** Nodes with no join relationship (two primaries,
+  sentinels) dial configured seeds and exchange authenticated `PeerHello` frames
+  to establish identified connections, feeding MSP liveness and elections. (#530)
+- **Equal-epoch tie-break.** When two primaries discover each other at the same
+  epoch (split-brain bootstrap), the lower node-id keeps leadership and the
+  other demotes cleanly. (#530)
+- **Periodic quorum-loss self-demotion.** A Cortex that loses quorum demotes
+  itself on a configurable interval. Recovery is automatic — once quorum is
+  restored, it re-elects at a fresh epoch. Gated by a `hadQuorum` latch to
+  prevent false demotion during bootstrap. (#527)
+- **`muninn_evolve` concept rename.** The `concept` field is now an optional
+  parameter. Omit to inherit the predecessor's label verbatim (existing
+  behavior); supply a new string to rename it. Fixes the class of orientation
+  bugs where a concept encoding mutable state ("answer owed", "PR blocked")
+  could never be corrected without destroying the ULID lineage. (#483)
+- **Server-side tag filters on recall.** `tags_all`, `tags_any`, and
+  `tag_filter` (key-prefix + lexical bounds) are now first-class params on
+  `muninn_recall`. Composes with semantic search and temporal filters. (#479)
+- **SSE push re-evaluation on embed.** A `PushOnWrite` subscription that
+  couldn't match at write time (vector score was 0, embedding not yet ready)
+  is re-evaluated once the retroactive processor inserts the embedding. Fires
+  exactly once; deduplicates against write-time deliveries. (#512)
+
 ### Fixed
+
+- **Demotion zombie eliminated.** After demotion the Cortex goroutine previously
+  parked at `<-ctx.Done()`, leaving the node in a half-leader state. Replaced
+  with a supervisor state machine (`modeLeading / modeFollowing /
+  modeWaitingQuorum`) that drives correct transitions. (#526)
+- **Convergent failover election.** Stale connections from the old topology were
+  not evicted after a failover, causing new join attempts to land on dead peers.
+  Leader-gated joins, `ClearLeader` on ODOWN, and `EvictIfConn` on connection
+  death bring the cluster to a stable single-leader state reliably. (#535, #536)
+- **Lobe identity reconciliation on join.** A Lobe that reconnected under a
+  different address was registered as a new member while the old entry persisted,
+  inflating membership counts and breaking quorum calculations. (#524)
+- **Voter count in `HandleVoteResponse`** — only registered voters counted,
+  resolving phantom-voter quorum inflation. (#525)
+- **Cluster topology in `/v1/cluster/info`** was reporting stale or incorrect
+  member lists after topology changes. (#518)
+- **Lobe replication stream.** A Lobe was closing the join connection
+  immediately after handshake; the Cortex streams replication entries over the
+  same connection, so the stream was immediately broken. (#515)
+- **JoinRequest.Role HMAC coverage.** The join HMAC covered only `node_id`,
+  leaving the `Role` field unauthenticated. Protocol v2 covers `nodeID + role`;
+  v1 nodes remain accepted during rolling upgrades. (#539)
+
+### Internal
+
+- MSP `odownFired` latch prevents duplicate ODOWN callbacks per episode.
+- `connKind` priority ordering (`kindJoin > kindHello > kindSeed`) prevents
+  inferior connections from evicting established ones.
+- TCP keepalive (15 s) set on all adopted peer connections.
+- MBP protocol version bumped to 2.
+
+---
+
+## [0.6.3] - 2026-06-11
+
+Hotfix release for issues found in production immediately after v0.6.2. Every
+fix ships with a regression test.
+
+### Fixed
+- **Multi-phrase semantic recall returned 0 results.** For a `context` of 2+
+  phrases, the query embedding was the flat N×dim concatenation of the
+  per-phrase vectors, fed to the dim-sized HNSW index — so the cosine length
+  guard zeroed every score. The query embedding is now mean-pooled into a single
+  dim-sized vector. Single-phrase recall was unaffected. (#498)
+- **`merge_entity` on case-variant names destroyed engram links.** Entity names
+  are hashed case-insensitively, so merging "Foo" into "foo" made source and
+  target the same key; the relink batch's Set+Delete then silently removed the
+  link to both casings. Now guarded at both the merge and relink layers. (#503)
+- **SSE push events were never delivered to SDK clients.** The server read
+  `on_write` while all SDKs send `push_on_write`; the status recorder also
+  lacked `Unwrap()`, killing SSE streams at the write deadline. Both fixed, plus
+  the Python SDK now parses the nested `engram` push payload. (#437)
+- **Inline-enriched memories were reported as un-enriched forever.**
+  Caller-supplied summary/relationships/type now set the matching digest flags,
+  so the enrichment-candidates query no longer returns them. (#500)
+- **HNSW: a failed index load was cached as a permanently empty index.** The
+  load is now retried on the next access; load outcomes are logged; the restore
+  iterator is scoped to the vault. (#499)
+- **`muninn_recall` serialization.** `content` no longer duplicates `summary`,
+  lifecycle `state` is populated, and scores no longer carry float32 noise. (#502)
+- **Local embedder mislabeled.** It was labeled `all-MiniLM-L6-v2` but is
+  `bge-small-en-v1.5`; additionally the Windows release binary shipped MiniLM
+  bytes under BGE pooling. Both corrected. (#455)
+- **Failed LLM-enrichment init now surfaces the real error** instead of
+  reporting only "Not configured". (#453)
+- **Entity-type validation is now consistent** across `remember`,
+  `entity_state`, and `apply_enrichment` (normalize + coerce on every
+  user-facing path). (#501)
+
+---
+
+## [0.6.2] - 2026-06-10
+
+### Security
+- **Vault isolation on the binary transports** — MBP (8474) and gRPC (8477) now enforce the same fail-closed vault model as REST/MCP: a keyed session is pinned to its key's vault (cross-vault access rejected, even to a public vault), an unauthenticated session may reach only public vaults, and a missing auth store fails closed (#484).
+- **LLM provider API keys masked** in the admin plugin-config API; a retyped key is saved, an untouched (masked) field is preserved (#488).
+- **Installer checksum verification** — releases now publish `checksums.txt`; `install.sh` / `install.ps1` verify the downloaded binary and refuse to install on mismatch (#489).
+- **Startup warning** when bound to a non-loopback address while the admin still has the default password (#490).
+
+### Added
+- TLS is now a first-class mode (epic #443): TLS setup in `muninn init` (#465), `muninn doctor` self-describes TLS state / bind addresses / cert details (#463), startup cert-expiry warning (#456), `docs/tls.md` + TLS-aware systemd unit (#466), Web UI host derived from the cert DNS SAN (#467).
+
+### Changed
+- Scheme-aware CLI URLs and clients throughout — printed URLs, generated AI-tool configs, and admin/vault HTTP clients honour `https` under TLS (#468, #469, #478); `muninn status` distinguishes a TLS trust failure from a dead server and no longer reads an all-cert-failure as "stopped" (#477, #481).
+- `muninn.env` is loaded before every subcommand, so lifecycle/status commands share the daemon's config (#476).
+- Activity chart buckets by the viewer's local calendar day (#458).
+- `go` directive bumped to 1.26.4 to clear govulncheck stdlib advisories (#464).
+
+### Fixed
+- **HNSW graph integrity** — link-before-promote, distance-based neighbor pruning, vault-scoped index load, and back-edge persistence; repairs silent degradation of semantic recall to a single reachable cluster (#471, also resolves #462).
+- `Evolve` no longer appends ` (evolved)` to the concept; lineage stays in the supersedes graph (#459).
+- Renamed-vault correctness — bulk vault operations and FTS reindex resolve the stored workspace prefix instead of the SipHash of the current name (#454, #480).
+- Consolidation dedup no longer mutates the cache-shared representative engram in place — was a data race against concurrent recalls (#492).
+- Decay/recency scoring clamps clock skew — a future `LastAccess`/`CreatedAt` no longer pushes retention above 1 (#493).
+- Memory detail panel "Created: Invalid Date" for search results (#461).
+
+### Internal
+- `storage.ErrNotFound` sentinel replaces `strings.Contains(err, "not found")` matching at the engine boundary (#491).
+- De-flaked the WAL syncer timing tests (#486).
+
+### Upgrade notes
+- The HNSW fix (#471) repairs the indexing algorithm but not graphs already degraded on disk by the old defects. If semantic recall has been returning too few results, run one `muninn vault reembed <vault>` per affected vault on this build to rebuild a correct graph.
+
+---
+
+## [0.6.1] - 2026-05-26
+
+### Fixed
+- `fix(cluster)` — defer the `OnLobeJoined` callback until the `JoinResponse` + snapshot are fully on the wire, so the streamer no longer races the handshake and corrupts the lobe-side parser (#449, #448 Bug 1).
+- `fix(cli)` — auto-detect TLS in `muninn status` / `muninn start` health probes (#444).
+
+### Changed
+- `feat(consolidation)` — the representative node absorbs the `AccessCount` of merged duplicates during dedup (#447).
+- `feat(enrichment)` — Gemini 2.5 Flash added as a Google enrichment option and promoted to the default Google model (#450, #452).
+- `chore(consolidation)` — dedup metadata-update errors are now surfaced in the consolidation report (#451).
+
+---
+
+## [0.6.0] - 2026-05-20
+
+### Added
+- **Audit logging** — structured audit trail with file, stdout, syslog, and webhook sinks; `audit tail/export/stats` CLI commands (#418).
+- **Retrieval annotations** — staleness, conflict, and trust metadata on recall responses (#388).
+- **MCP `initialize` instructions** response.
+
+### Fixed
+- `fix(fts)` — auto-restart worker goroutines after a panic; include the field byte in the BM25 posting key (multi-field terms were silently overwritten); scope the IDF cache per `(vault, term)` (#430).
+- `fix(storage)` — vault deletion now clears all per-vault prefixes and entity-graph data and prunes orphaned global entity records (#435, #436, #438).
+- `fix(cli)` — `muninn status` / `start` probes honour `MUNINNDB_{ADMIN,MCP,UI}_URL` (#439, #440).
+- `fix(engine)` — content-hash dedup race, enrichment ghost-queue deadlock, trigger nil-metadata crash.
+- `fix(auth)` — validate the Bearer token before parsing the body to prevent DoS amplification (#416).
+- `fix(import)` — pipe deadlock and orphaned vault name on a failed import (#412).
+
+### Security
+- gRPC bumped to v1.79.3; govulncheck added to CI.
+
+---
+
+## [0.5.1] - 2026-05-06
+
+### Fixed
+- `fix(fts)` — auto-restart FTS worker goroutines after a panic (a panicked worker was never replaced, eventually making all new writes unsearchable until restart); include the field byte in the BM25 posting key; scope the IDF cache by `(vault, term)` (#430).
+
+---
+
+## [0.5.0] - 2026-04-27
+
+### Added
+- **Per-engram trust/taint labels** (#387) — `TrustLevel` (`verified`/`inferred`/`external`/`untrusted`) stored at a fixed ERF offset (zero-migration); all writes auto-stamp `inferred`; trust is visible in `muninn_read`/`muninn_recall`; new `muninn_trust` MCP tool; `ExcludeUntrusted` per-vault plasticity option.
+- **Cursor pagination** for `muninn_get_enrichment_candidates` so large vaults no longer miss candidates (#362).
+
+### Fixed
+- `fix(engine)` — 400 for invalid inline association target IDs (#399).
+- `fix(rest)` — 400 instead of 500 for invalid engram IDs in `/api/link` (#395).
+- `fix(enrich)` — prevent infinite retry loops that deadlocked the circuit breaker (#390).
+- `fix(trigger)` — guard against nil metadata in `sweepVault` / `handleCognitive` (#393).
+- `fix(activation)` — restore the RRF score for BFS-traversed candidates in the ACT-R/CGDN paths.
+- `fix(rest)` — delete phantom vaults that existed only in auth config.
+
+### Internal
+- `refactor(auth)` — extract `ParseBearerToken`, `ValidateStaticToken`, `IsValidVaultName` into the shared `internal/auth` package.
+
+---
+
+## [0.4.12-alpha] - 2026-04-06
+
+### Fixed
+- **MCP vault-isolation bypass** — `mk_` vault-scoped keys now enforce vault pinning in open-server mode (no static token); previously any MCP caller could reach any vault by naming it. Invalid/revoked `mk_` keys fail closed; SSE message-endpoint auth re-validation tightened (#368).
+
+---
+
+## [0.4.11-alpha] - 2026-04-05
+
+### Added
+- **Long-Term Potentiation (LTP)** — Hebbian associations strengthen over repeated co-activation; configurable via plasticity config.
+- **Reciprocal Rank Fusion (RRF)** scoring strategy, selectable alongside ACT-R and Ebbinghaus.
+- **Content-hash deduplication** at write time.
+- **Agent-managed enrichment via MCP** — `muninn_get_enrichment_candidates` / `muninn_apply_enrichment`.
+- **`X-Client-Name: MuninnDB`** header on outbound LLM (embed/enrich) requests.
+
+### Fixed
+- **Cluster join handshake (4 bugs)** — register the live `net.Conn` before responding; remove the epoch guard so a Cortex restart re-triggers election; accept both `secret` and `cluster_secret` JSON fields; honour `MUNINN_ADMIN_PASSWORD` at bootstrap.
+
+---
+
+## [0.4.10] - 2026-04-02
+
+### Added
+- Dashboard activity panel overhaul: selectable timeframe presets (7d–180d, capped at 180 days), end-date picker, dynamic x-axis tick grouping based on chart width, and a raw data table toggle with copy-to-clipboard. Includes loading, error, and empty-state feedback.
+- `GET /api/activity-counts` endpoint returning per-day engram creation counts for a vault. Accepts `days` (1–180, default 7) and optional `until` (YYYY-MM-DD) query parameters. Malformed or out-of-range values return 400. Backed by an efficient ULID key-header scan with zero-filled contiguous day ranges.
+
+### Changed
+- Web UI: unified tab navigation across Memories, Graph, and Settings pages with a consistent bordered-tab style replacing the previous mix of underline, button, and pill patterns.
+- Public vault unauthenticated access now runs in `full` mode. Previously, requests to an open vault with no API key ran as `observe`, silently preventing cognitive-state writes. Public vaults are now genuinely open — callers get `full` access unless they present an explicit `observe` key.
+
+### Fixed
+- Native `<select>` dropdowns unreadable in dark mode — `--bg-card` CSS variable was referenced but never defined; added it to both themes and added global select/option styling for proper dark/light rendering.
+- Sidebar nav items are now scrollable when viewport height is too small, keeping the logo and footer pinned.
+- Collapsed sidebar footer icons no longer overflow into the right border; icons render borderless when collapsed and bordered when expanded.
+- "New Vault" action moved from sidebar footer into the vault picker modal to reclaim vertical space for nav items.
+- Sidebar footer icons (theme toggle, keyboard shortcuts) replaced with consistent SVG icons matching the existing icon family.
+- Version label merged into the footer icon row instead of occupying its own line.
+- Sidebar footer padding and gaps tightened to maximize nav item visibility on short viewports.
+- Memories page search-mode segmented control (Balanced/Semantic/Recent/Deep) now matches adjacent button height and font size, includes dividers between options, and preserves padding when Alpine.js re-renders dynamic styles.
 - Enrich now accepts OpenAI-compatible JSON responses returned in `message.reasoning` when `message.content` is empty, including structured reasoning payloads.
 - Retry and retroactive enrichment now only mark entity and relationship stages complete after successful persistence, avoiding partial-state retries, nil-result crashes, and silent graph-write failures.
 - Entity and relationship response parsing now rejects nested wrapper keys like `meta.entities` / `meta.relationships` instead of treating them as valid empty results.
 - Vault-scoped REST routes now resolve non-default vaults consistently from authenticated request bodies as well as `?vault=`, and reject mismatched query/body vaults.
 - Vault-scoped REST routes are setup to deprecate vault passed in the body in a later release.
 - REST read responses now include `memory_type: 0` for fact-classified memories instead of omitting the field.
+- Observe-mode API keys now return `403` on semantically mutating REST and gRPC routes while preserving access to read-like POST endpoints such as activation, traversal, explanation, and batch link reads.
+- ACT-R scoring: `bLevelCap` prevents base-level saturation in fresh vaults; two-pass per-query normalization ensures scores stay in [0, 1] range.
+- Archived engrams (dream engine) now filtered at all retrieval points — query, find-by-entity, trigger worker sweeps.
+- Dormant flag now gated on `!UseACTR`; in ACT-R mode the flag is derived from activation score rather than the Ebbinghaus relevance field.
+- Web UI: form class consistency, segmented control hover state, uniform input/button sizing, memory filter bar density, page title branding, logs page full-width layout, observability view hash routing.
+- SSE keepalive uses spec-compliant comment frame (`: keepalive`) to prevent proxy idle timeouts.
+- Entity type allowlist expanded from 8 to 14 types; unknown types pass through without coercion.
+- Clipboard API guarded by secure-context check with `execCommand` fallback for HTTP installs.
+- Pebble `ErrNotFound` distinguished from other errors in embed migration path.
 
 ---
 
@@ -169,7 +423,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Comparison Links
 
-[Unreleased]: https://github.com/scrypster/muninndb/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/scrypster/muninndb/compare/v0.4.10...HEAD
+[0.4.10]: https://github.com/scrypster/muninndb/compare/v0.4.9-alpha...v0.4.10
 [0.2.6]: https://github.com/scrypster/muninndb/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/scrypster/muninndb/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/scrypster/muninndb/compare/v0.2.3...v0.2.4

@@ -45,6 +45,51 @@ type Server struct {
 	tlsConfig *tls.Config // nil = plain TCP
 }
 
+func denyReadOnlyMutation(ctx context.Context) error {
+	if auth.ReadOnlyFromContext(ctx) {
+		return status.Error(codes.PermissionDenied, "read-only key cannot write")
+	}
+	return nil
+}
+
+// resolveRequestVault validates the vault named in an RPC request against the
+// authenticated context and returns the vault to hand to the engine. It mirrors
+// the REST layer's validateResolvedVault so gRPC enforces the same vault model:
+//
+//   - Keyed request: the key's vault is authoritative. An empty request vault
+//     resolves to it; any other value is PermissionDenied (a key scoped to
+//     vault A can never operate on vault B, even a public one). The auth
+//     interceptor validates the key but does not pin the vault — this is where
+//     the pin is enforced.
+//   - Unkeyed request: the request vault (default "default") must be a vault
+//     configured Public, else Unauthenticated. This re-check is essential for
+//     streaming RPCs (Activate, Subscribe), where the interceptor runs before
+//     the first message arrives and can only pre-authorize "default".
+//
+// Fails closed when no auth store is present.
+func (s *Server) resolveRequestVault(ctx context.Context, reqVault string) (string, error) {
+	reqVault = strings.TrimSpace(reqVault)
+	if key, ok := ctx.Value(auth.ContextAPIKey).(*auth.APIKey); ok && key != nil {
+		if reqVault != "" && reqVault != key.Vault {
+			return "", status.Errorf(codes.PermissionDenied, "api key is not authorized for vault %q", reqVault)
+		}
+		return key.Vault, nil
+	}
+
+	vault := reqVault
+	if vault == "" {
+		vault = "default"
+	}
+	if s.authStore == nil {
+		return "", status.Errorf(codes.Unauthenticated, "vault %q requires an API key", vault)
+	}
+	cfg, err := s.authStore.GetVaultConfig(vault)
+	if err != nil || !cfg.Public {
+		return "", status.Errorf(codes.Unauthenticated, "vault %q requires an API key", vault)
+	}
+	return vault, nil
+}
+
 // NewServer creates a new gRPC server.
 // authStore is required and used to validate API keys on every inbound RPC.
 // tlsConfig, if non-nil, enables TLS using gRPC transport credentials.
@@ -89,6 +134,7 @@ func NewServer(addr string, engine EngineAPI, authStore *auth.Store, tlsConfig *
 //     codes.Unauthenticated regardless of vault visibility.
 //   - If no token is provided, the vault config is consulted. Non-public vaults
 //     (including unconfigured vaults, which default to fail-closed) require a key.
+//     Public vaults run in full mode.
 //
 // The vault name is read from the request if it implements VaultNamer; otherwise
 // "default" is used.
@@ -132,7 +178,7 @@ func (s *Server) authUnaryInterceptor(ctx context.Context, req any, _ *grpc.Unar
 	}
 
 	ctx = context.WithValue(ctx, auth.ContextVault, vault)
-	ctx = context.WithValue(ctx, auth.ContextMode, "observe")
+	ctx = context.WithValue(ctx, auth.ContextMode, auth.ModeFull)
 	return handler(ctx, req)
 }
 
@@ -176,14 +222,15 @@ func (s *Server) authStreamInterceptor(srv any, ss grpc.ServerStream, _ *grpc.St
 		return handler(srv, &wrappedStream{ss, ctx})
 	}
 
-	// No token — check default vault config (fail-closed).
+	// No token — check default vault config (fail-closed). Public default vault
+	// requests run in full mode.
 	cfg, err := s.authStore.GetVaultConfig("default")
 	if err != nil || !cfg.Public {
 		return status.Errorf(codes.Unauthenticated, "vault %q requires an API key", "default")
 	}
 
 	ctx = context.WithValue(ctx, auth.ContextVault, "default")
-	ctx = context.WithValue(ctx, auth.ContextMode, "observe")
+	ctx = context.WithValue(ctx, auth.ContextMode, auth.ModeFull)
 	return handler(srv, &wrappedStream{ss, ctx})
 }
 
@@ -224,6 +271,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 // Hello implements the Hello RPC.
 func (s *Server) Hello(ctx context.Context, req *pb.HelloRequest) (*pb.HelloResponse, error) {
+	vault, err := s.resolveRequestVault(ctx, req.Vault)
+	if err != nil {
+		return nil, err
+	}
+	req.Vault = vault
 	resp, err := s.engine.Hello(ctx, req)
 	if err != nil {
 		slog.Error("hello failed", "error", err)
@@ -234,6 +286,14 @@ func (s *Server) Hello(ctx context.Context, req *pb.HelloRequest) (*pb.HelloResp
 
 // Write implements the Write RPC.
 func (s *Server) Write(ctx context.Context, req *pb.WriteRequest) (*pb.WriteResponse, error) {
+	if err := denyReadOnlyMutation(ctx); err != nil {
+		return nil, err
+	}
+	vault, err := s.resolveRequestVault(ctx, req.Vault)
+	if err != nil {
+		return nil, err
+	}
+	req.Vault = vault
 	resp, err := s.engine.Write(ctx, req)
 	if err != nil {
 		slog.Error("write failed", "error", err)
@@ -244,6 +304,16 @@ func (s *Server) Write(ctx context.Context, req *pb.WriteRequest) (*pb.WriteResp
 
 // BatchWrite implements the BatchWrite RPC.
 func (s *Server) BatchWrite(ctx context.Context, req *pb.BatchWriteRequest) (*pb.BatchWriteResponse, error) {
+	if err := denyReadOnlyMutation(ctx); err != nil {
+		return nil, err
+	}
+	for _, w := range req.Requests {
+		vault, err := s.resolveRequestVault(ctx, w.Vault)
+		if err != nil {
+			return nil, err
+		}
+		w.Vault = vault
+	}
 	resp, err := s.engine.BatchWrite(ctx, req)
 	if err != nil {
 		slog.Error("batch write failed", "error", err)
@@ -254,6 +324,11 @@ func (s *Server) BatchWrite(ctx context.Context, req *pb.BatchWriteRequest) (*pb
 
 // Read implements the Read RPC.
 func (s *Server) Read(ctx context.Context, req *pb.ReadRequest) (*pb.ReadResponse, error) {
+	vault, err := s.resolveRequestVault(ctx, req.Vault)
+	if err != nil {
+		return nil, err
+	}
+	req.Vault = vault
 	resp, err := s.engine.Read(ctx, req)
 	if err != nil {
 		slog.Error("read failed", "error", err)
@@ -264,6 +339,14 @@ func (s *Server) Read(ctx context.Context, req *pb.ReadRequest) (*pb.ReadRespons
 
 // Forget implements the Forget RPC.
 func (s *Server) Forget(ctx context.Context, req *pb.ForgetRequest) (*pb.ForgetResponse, error) {
+	if err := denyReadOnlyMutation(ctx); err != nil {
+		return nil, err
+	}
+	vault, err := s.resolveRequestVault(ctx, req.Vault)
+	if err != nil {
+		return nil, err
+	}
+	req.Vault = vault
 	resp, err := s.engine.Forget(ctx, req)
 	if err != nil {
 		slog.Error("forget failed", "error", err)
@@ -274,6 +357,11 @@ func (s *Server) Forget(ctx context.Context, req *pb.ForgetRequest) (*pb.ForgetR
 
 // Stat implements the Stat RPC.
 func (s *Server) Stat(ctx context.Context, req *pb.StatRequest) (*pb.StatResponse, error) {
+	vault, err := s.resolveRequestVault(ctx, req.Vault)
+	if err != nil {
+		return nil, err
+	}
+	req.Vault = vault
 	resp, err := s.engine.Stat(ctx, req)
 	if err != nil {
 		slog.Error("stat failed", "error", err)
@@ -284,6 +372,14 @@ func (s *Server) Stat(ctx context.Context, req *pb.StatRequest) (*pb.StatRespons
 
 // Link implements the Link RPC.
 func (s *Server) Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkResponse, error) {
+	if err := denyReadOnlyMutation(ctx); err != nil {
+		return nil, err
+	}
+	vault, err := s.resolveRequestVault(ctx, req.Vault)
+	if err != nil {
+		return nil, err
+	}
+	req.Vault = vault
 	resp, err := s.engine.Link(ctx, req)
 	if err != nil {
 		slog.Error("link failed", "error", err)
@@ -295,6 +391,11 @@ func (s *Server) Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkRespons
 // Activate implements the Activate RPC (server-streaming).
 func (s *Server) Activate(req *pb.ActivateRequest, stream pb.MuninnDB_ActivateServer) error {
 	ctx := stream.Context()
+	vault, err := s.resolveRequestVault(ctx, req.Vault)
+	if err != nil {
+		return err
+	}
+	req.Vault = vault
 	resp, err := s.engine.Activate(ctx, req)
 	if err != nil {
 		slog.Error("activate failed", "error", err)
@@ -320,6 +421,15 @@ func (s *Server) Subscribe(stream pb.MuninnDB_SubscribeServer) error {
 	if err != nil {
 		return err
 	}
+
+	// Enforce vault scope on the subscription's vault. The stream interceptor
+	// runs before this first message, so for unkeyed sessions it could only
+	// pre-authorize "default"; re-resolve here against the actual vault.
+	vault, err := s.resolveRequestVault(ctx, req.Vault)
+	if err != nil {
+		return err
+	}
+	req.Vault = vault
 
 	// Buffered push channel. The deliver func is non-blocking: it drops the push
 	// if the channel is full so the trigger worker goroutine is never blocked.

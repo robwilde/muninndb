@@ -13,7 +13,7 @@ import (
 // mockEngineAPI implements EngineAPI for testing the RESTEngineWrapper's
 // offset/limit slicing and stat injection logic without needing a real engine.
 type mockEngineAPI struct {
-	EngineAPI // embed for unused methods
+	EngineAPI    // embed for unused methods
 	activateResp *ActivateResponse
 	activateErr  error
 	statResp     *StatResponse
@@ -57,6 +57,9 @@ func (m *mockEngineAPI) ListVaults(ctx context.Context) ([]string, error) {
 }
 func (m *mockEngineAPI) GetSession(ctx context.Context, req *GetSessionRequest) (*GetSessionResponse, error) {
 	return nil, nil
+}
+func (m *mockEngineAPI) GetActivityCounts(ctx context.Context, req *ActivityCountsRequest) (*ActivityCountsResponse, error) {
+	return &ActivityCountsResponse{Counts: []ActivityCountItem{}}, nil
 }
 func (m *mockEngineAPI) WorkerStats() cognitive.EngineWorkerStats {
 	return cognitive.EngineWorkerStats{}

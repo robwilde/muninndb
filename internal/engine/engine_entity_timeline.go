@@ -19,11 +19,11 @@ type TimelineEntry struct {
 
 // EntityTimeline represents the complete timeline of an entity from first mention to now.
 type EntityTimeline struct {
-	Entity       string           `json:"entity"`
-	FirstSeen    time.Time        `json:"first_seen"`
-	MentionCount int              `json:"mention_count"`
-	Entries      []TimelineEntry  `json:"timeline"`
-	Count        int              `json:"count"`
+	Entity       string          `json:"entity"`
+	FirstSeen    time.Time       `json:"first_seen"`
+	MentionCount int             `json:"mention_count"`
+	Entries      []TimelineEntry `json:"timeline"`
+	Count        int             `json:"count"`
 }
 
 // GetEntityTimeline returns a chronological view of when an entity first appeared
@@ -69,8 +69,8 @@ func (e *Engine) GetEntityTimeline(ctx context.Context, vault string, entityName
 			return nil // skip missing/deleted
 		}
 
-		// Skip soft-deleted engrams.
-		if eng.State == storage.StateSoftDeleted {
+		// Skip soft-deleted and archived engrams.
+		if eng.State == storage.StateSoftDeleted || eng.State == storage.StateArchived {
 			return nil
 		}
 

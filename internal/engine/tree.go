@@ -3,10 +3,12 @@ package engine
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/scrypster/muninndb/internal/index/fts"
+	"github.com/scrypster/muninndb/internal/plugin"
 	"github.com/scrypster/muninndb/internal/storage"
 )
 
@@ -43,11 +45,12 @@ type RememberTreeResult struct {
 
 // AddChildInput is the input for adding a single child engram to a parent.
 type AddChildInput struct {
-	Concept string
-	Content string
-	Type    string
-	Tags    []string
-	Ordinal *int32 // nil = append at end (max ordinal + 1)
+	Concept   string
+	Content   string
+	Type      string
+	Tags      []string
+	Ordinal   *int32    // nil = append at end (max ordinal + 1)
+	Embedding []float32 // optional client-provided embedding vector
 }
 
 // AddChildResult is returned by AddChild.
@@ -132,6 +135,7 @@ func (e *Engine) RememberTree(ctx context.Context, req *RememberTreeRequest) (*R
 			Concept: item.input.Concept,
 			Content: item.input.Content,
 			Tags:    item.input.Tags,
+			Trust:   storage.TrustInferred, // all new MCP writes default to inferred
 		}
 		if item.input.Type != "" {
 			if mt, ok := storage.ParseMemoryType(item.input.Type); ok {
@@ -239,9 +243,11 @@ func (e *Engine) AddChild(ctx context.Context, vault, parentID string, input *Ad
 
 	// Build the child engram struct directly (same pattern as RememberTree).
 	child := &storage.Engram{
-		Concept: input.Concept,
-		Content: input.Content,
-		Tags:    input.Tags,
+		Concept:   input.Concept,
+		Content:   input.Content,
+		Tags:      input.Tags,
+		Embedding: input.Embedding,
+		Trust:     storage.TrustInferred, // all new MCP writes default to inferred
 	}
 	if input.Type != "" {
 		if mt, ok := storage.ParseMemoryType(input.Type); ok {
@@ -303,6 +309,18 @@ func (e *Engine) AddChild(ctx context.Context, vault, parentID string, input *Ad
 		mu.Unlock()
 		if commitErr != nil {
 			return nil, fmt.Errorf("add child: commit batch: %w", commitErr)
+		}
+	}
+
+	// When the caller provided an embedding, mark DigestEmbed and insert into
+	// HNSW inline (the retroactive processor skips DigestEmbed-flagged engrams).
+	if len(input.Embedding) > 0 {
+		existing, _ := e.store.GetDigestFlags(ctx, plugin.ULID(child.ID))
+		if err := e.store.SetDigestFlag(ctx, child.ID, existing|plugin.DigestEmbed); err != nil {
+			slog.Warn("engine: add child: failed to set DigestEmbed flag", "id", child.ID.String(), "err", err)
+		}
+		if err := e.hnswRegistry.Insert(ctx, ws, [16]byte(child.ID), input.Embedding); err != nil {
+			slog.Warn("engine: add child: failed to insert client embedding into HNSW", "id", child.ID.String(), "err", err)
 		}
 	}
 
@@ -454,7 +472,7 @@ func (e *Engine) recallTreeNode(
 			// Filter out: missing metadata (hard-deleted ghost), completed, or
 			// soft-deleted children. StateSoftDeleted != StateCompleted so both
 			// states must be checked explicitly.
-			if !ok || meta == nil || meta.State == storage.StateCompleted || meta.State == storage.StateSoftDeleted {
+			if !ok || meta == nil || meta.State == storage.StateCompleted || meta.State == storage.StateSoftDeleted || meta.State == storage.StateArchived {
 				continue
 			}
 		}

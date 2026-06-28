@@ -20,14 +20,41 @@ var ErrEngramNotFound = errors.New("engram not found")
 // been soft-deleted. Use errors.Is to check for this error in callers.
 var ErrEngramSoftDeleted = errors.New("engram is soft-deleted")
 
+// ErrEngramArchived is returned when an operation targets an engram that has
+// been archived. Use errors.Is to check for this error in callers.
+var ErrEngramArchived = errors.New("engram is archived")
+
 // ErrVaultNameCollision is returned when a rename or clone targets a vault name
 // that already exists. Use errors.Is to check for this error in callers.
 var ErrVaultNameCollision = errors.New("vault name already exists")
+
+// ErrInvalidID is returned when a caller passes an ID that cannot be parsed as
+// a valid ULID. Use errors.Is to check for this error in callers; REST handlers
+// map it to HTTP 400 Bad Request.
+var ErrInvalidID = errors.New("invalid engram id")
+
+// ErrInvalidRequest is returned when a caller passes a field value that is
+// syntactically valid but semantically out of range (e.g. a CreatedAt timestamp
+// that is before the project epoch or too far in the future). REST handlers map
+// it to HTTP 422 Unprocessable Entity.
+var ErrInvalidRequest = errors.New("invalid request")
 
 // ClearVault removes all memories from a vault. The vault name remains registered.
 // It evicts all in-memory state (HNSW, FTS IDF cache, novelty fingerprints, coherence
 // counters, activity tracking) and adjusts the global engramCount.
 func (e *Engine) ClearVault(ctx context.Context, vaultName string) error {
+	if !e.beginVaultOp() {
+		return fmt.Errorf("engine is shutting down")
+	}
+	defer e.endVaultOp()
+
+	opCtx, stop := e.vaultOpContext(ctx)
+	defer stop()
+
+	return e.clearVault(opCtx, vaultName)
+}
+
+func (e *Engine) clearVault(ctx context.Context, vaultName string) error {
 	mu := e.getVaultMutex(vaultName)
 	mu.Lock()
 	defer mu.Unlock()
@@ -48,7 +75,11 @@ func (e *Engine) ClearVault(ctx context.Context, vaultName string) error {
 		return fmt.Errorf("vault %q: %w", vaultName, ErrVaultNotFound)
 	}
 
-	ws := e.store.VaultPrefix(vaultName)
+	// Use ResolveVaultPrefix so renamed vaults (ws ≠ siphash(currentName))
+	// are cleared at their actual workspace. With raw VaultPrefix(name) here,
+	// ClearVault on a renamed vault would silently range-delete an empty
+	// prefix and leave the real engrams orphaned.
+	ws := e.store.ResolveVaultPrefix(vaultName)
 
 	// NOTE: Jobs already mid-flush may write ghost FTS entries after the range
 	// tombstones land. This is harmless — activation filtering skips engrams
@@ -107,11 +138,24 @@ var ErrVaultJobActive = fmt.Errorf("vault has an active clone/merge job in progr
 // It calls ClearVault (which adjusts engramCount and in-memory state),
 // then deletes the vault name keys from storage.
 //
-// Note: ws must be captured BEFORE calling ClearVault, because ClearVault
-// evicts vaultPrefixCache for the vault name. After ClearVault,
-// store.VaultPrefix would still return the SipHash but the name is no longer
-// registered — DeleteVaultNameOnly needs the ws captured before eviction.
+// Note: ws is resolved via ResolveVaultPrefix BEFORE calling ClearVault,
+// because ClearVault evicts vaultPrefixCache for the vault name. After
+// eviction, a subsequent ResolveVaultPrefix call would still read the
+// persisted 0x0F index — but for renamed vaults we need the index lookup
+// (not raw SipHash) to find the real ws, so we capture it up front.
 func (e *Engine) DeleteVault(ctx context.Context, vaultName string) error {
+	if !e.beginVaultOp() {
+		return fmt.Errorf("engine is shutting down")
+	}
+	defer e.endVaultOp()
+
+	opCtx, stop := e.vaultOpContext(ctx)
+	defer stop()
+
+	return e.deleteVault(opCtx, vaultName)
+}
+
+func (e *Engine) deleteVault(ctx context.Context, vaultName string) error {
 	// Reject deletion if a clone/merge job is actively writing into this vault
 	// (i.e., the vault is the Target of a running job). Deleting a vault that is
 	// a Source is allowed — the merge's own post-copy cleanup calls DeleteVault
@@ -121,9 +165,11 @@ func (e *Engine) DeleteVault(ctx context.Context, vaultName string) error {
 	}
 
 	// Capture ws BEFORE ClearVault evicts the in-memory name cache.
-	ws := e.store.VaultPrefix(vaultName)
+	// ResolveVaultPrefix so renamed vaults (ws ≠ siphash(currentName))
+	// have their actual workspace passed to DeleteVaultNameOnly.
+	ws := e.store.ResolveVaultPrefix(vaultName)
 
-	if err := e.ClearVault(ctx, vaultName); err != nil {
+	if err := e.clearVault(ctx, vaultName); err != nil {
 		return fmt.Errorf("delete vault (clear phase): %w", err)
 	}
 
@@ -158,6 +204,11 @@ func (e *Engine) DeleteVault(ctx context.Context, vaultName string) error {
 // doesn't exist, ErrVaultJobActive if a clone/merge job targets the vault,
 // or an error if newName already exists.
 func (e *Engine) RenameVault(ctx context.Context, oldName, newName string) error {
+	if !e.beginVaultOp() {
+		return fmt.Errorf("engine is shutting down")
+	}
+	defer e.endVaultOp()
+
 	e.vaultOpsMu.Lock()
 	defer e.vaultOpsMu.Unlock()
 

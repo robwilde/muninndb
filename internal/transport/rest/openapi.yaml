@@ -875,8 +875,10 @@ components:
       type: object
       properties:
         code:
-          type: integer
-          description: "Machine-readable MBP error code."
+          oneOf:
+            - type: integer
+            - type: string
+          description: "Machine-readable error code. Handler-level errors use numeric MBP codes; middleware and auth errors may use string codes."
         message:
           type: string
         request_id:
@@ -1347,6 +1349,31 @@ components:
         triggered:
           type: boolean
 
+    # ── Activity counts ─────────────────────────────────────────────────────
+
+    ActivityCountItem:
+      type: object
+      required: [date, count]
+      properties:
+        date:
+          type: string
+          format: date
+          description: "UTC calendar date (YYYY-MM-DD)."
+        count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: "Number of engrams created on this day."
+
+    ActivityCountsResponse:
+      type: object
+      required: [counts]
+      properties:
+        counts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ActivityCountItem"
+
   responses:
     BadRequest:
       description: "Invalid request body or parameters."
@@ -1356,6 +1383,12 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     Unauthorized:
       description: "Missing or invalid authentication."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Forbidden:
+      description: "Authenticated but not permitted to perform the operation."
       content:
         application/json:
           schema:
@@ -1551,6 +1584,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "409":
           description: "Idempotency key collision."
           content:
@@ -1574,7 +1609,8 @@ paths:
           in: query
           schema:
             type: integer
-            default: 20
+            default: 50
+            maximum: 200
         - name: offset
           in: query
           schema:
@@ -1613,6 +1649,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalServerError"
 
@@ -1674,6 +1712,8 @@ paths:
                 $ref: "#/components/schemas/ForgetResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -1740,6 +1780,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalServerError"
 
@@ -1769,6 +1811,8 @@ paths:
                 $ref: "#/components/schemas/RestoreResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -1803,6 +1847,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalServerError"
 
@@ -1832,6 +1878,8 @@ paths:
                 $ref: "#/components/schemas/RetryEnrichResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -1882,6 +1930,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalServerError"
 
@@ -1910,6 +1960,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalServerError"
 
@@ -1989,6 +2041,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalServerError"
 
@@ -2015,6 +2069,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalServerError"
 
@@ -2103,6 +2159,66 @@ paths:
                 $ref: "#/components/schemas/GetSessionResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
+
+  /api/activity-counts:
+    get:
+      tags: [vault]
+      summary: "Per-day engram creation counts for a vault."
+      description: >
+        Returns the last `days` calendar days of engram creation counts
+        ending on `until` (inclusive). Counts are bucketed by calendar day in
+        the timezone given by `tz` (UTC when `tz` is omitted or unrecognized).
+        Uses an efficient ULID key-header scan that never deserializes engram
+        values. Days that have zero writes are included with a count of 0 so
+        clients always get a contiguous series.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: vault
+          in: query
+          schema:
+            type: string
+            default: "default"
+        - name: days
+          in: query
+          description: "Number of calendar days to include (1–180, default 7). Returns 400 if out of range or non-numeric."
+          schema:
+            type: integer
+            default: 7
+            minimum: 1
+            maximum: 180
+        - name: until
+          in: query
+          description: "End date in YYYY-MM-DD format, interpreted in `tz` (default: today in `tz`). Returns 400 if malformed."
+          schema:
+            type: string
+            format: date
+        - name: tz
+          in: query
+          description: >
+            IANA timezone name (e.g. `America/Los_Angeles`) used to bucket
+            counts into calendar days and to interpret `until`. Missing,
+            unrecognized, or overly long (>64 chars) values silently fall back
+            to UTC; this parameter never causes an error.
+          schema:
+            type: string
+            default: "UTC"
+            example: "America/Los_Angeles"
+      responses:
+        "200":
+          description: "Daily activity counts."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActivityCountsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   # ── Cognitive ─────────────────────────────────────────────────────────────
 
@@ -2520,6 +2636,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":

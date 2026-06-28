@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -8,13 +9,20 @@ import (
 	"github.com/scrypster/muninndb/internal/engine/vaultjob"
 	"github.com/scrypster/muninndb/internal/metrics"
 	"github.com/scrypster/muninndb/internal/storage"
-	"golang.org/x/net/context"
 )
 
 // ExportVault synchronously exports the named vault to w as a .muninn archive.
 // Returns an ExportResult with engram count and total key count.
 // Returns ErrVaultNotFound if the vault does not exist.
 func (e *Engine) ExportVault(ctx context.Context, vaultName, embedderModel string, dimension int, resetMeta bool, w io.Writer) (*storage.ExportResult, error) {
+	if !e.beginVaultOp() {
+		return nil, fmt.Errorf("engine is shutting down")
+	}
+	defer e.endVaultOp()
+
+	opCtx, stop := e.vaultOpContext(ctx)
+	defer stop()
+
 	names, err := e.store.ListVaultNames()
 	if err != nil {
 		return nil, fmt.Errorf("export vault: list vaults: %w", err)
@@ -30,13 +38,15 @@ func (e *Engine) ExportVault(ctx context.Context, vaultName, embedderModel strin
 		return nil, fmt.Errorf("export vault %q: %w", vaultName, ErrVaultNotFound)
 	}
 
-	ws := e.store.VaultPrefix(vaultName)
+	// Use ResolveVaultPrefix so vaults whose name has been changed via RenameVault
+	// (ws ≠ siphash(currentName)) are exported via their actual stored workspace.
+	ws := e.store.ResolveVaultPrefix(vaultName)
 	opts := storage.ExportOpts{
 		EmbedderModel: embedderModel,
 		Dimension:     dimension,
 		ResetMetadata: resetMeta,
 	}
-	result, err := e.store.ExportVaultData(ctx, ws, vaultName, opts, w)
+	result, err := e.store.ExportVaultData(opCtx, ws, vaultName, opts, w)
 	if err != nil {
 		return nil, fmt.Errorf("export vault %q: %w", vaultName, err)
 	}
@@ -48,6 +58,11 @@ func (e *Engine) ExportVault(ctx context.Context, vaultName, embedderModel strin
 // Returns the job immediately (202 pattern).
 // Returns an error if vaultName already exists.
 func (e *Engine) StartImport(ctx context.Context, vaultName, embedderModel string, dimension int, resetMeta bool, r io.Reader) (*vaultjob.Job, error) {
+	if !e.beginVaultOp() {
+		return nil, fmt.Errorf("engine is shutting down")
+	}
+	defer e.endVaultOp()
+
 	e.vaultOpsMu.Lock()
 
 	names, err := e.store.ListVaultNames()
@@ -86,7 +101,13 @@ func (e *Engine) StartImport(ctx context.Context, vaultName, embedderModel strin
 		ExpectedModel:     embedderModel,
 		ExpectedDimension: dimension,
 	}
-	if !e.spawnJob(func() { e.runImport(job, wsTarget, vaultName, r, opts) }) {
+	var rc io.ReadCloser
+	if c, ok := r.(io.ReadCloser); ok {
+		rc = c
+	} else {
+		rc = io.NopCloser(r)
+	}
+	if !e.spawnJob(func() { e.runImport(job, wsTarget, vaultName, rc, opts) }) {
 		e.jobManager.Fail(job, fmt.Errorf("engine is shutting down"))
 		// Do NOT call DeleteVaultNameOnly here: the engine is shutting down and
 		// Pebble may already be closed, which would panic. The orphaned vault name
@@ -97,7 +118,7 @@ func (e *Engine) StartImport(ctx context.Context, vaultName, embedderModel strin
 	return job, nil
 }
 
-func (e *Engine) runImport(job *vaultjob.Job, wsTarget [8]byte, vaultName string, r io.Reader, opts storage.ImportOpts) {
+func (e *Engine) runImport(job *vaultjob.Job, wsTarget [8]byte, vaultName string, r io.ReadCloser, opts storage.ImportOpts) {
 	// Use engine lifecycle context so the goroutine exits when Stop() is called.
 	ctx := e.stopCtx
 
@@ -114,12 +135,21 @@ func (e *Engine) runImport(job *vaultjob.Job, wsTarget [8]byte, vaultName string
 			slog.Error("import job panicked", "job_id", job.ID, "vault", vaultName, "panic", rec)
 		}
 	}()
+	defer r.Close()
 
 	// Phase 1: import data from archive.
 	result, err := e.store.ImportVaultData(ctx, wsTarget, vaultName, opts, r)
 	if err != nil {
 		metrics.ImportJobsTotal.WithLabelValues("failed").Inc()
 		e.jobManager.Fail(job, fmt.Errorf("import phase: %w", err))
+		// Clean up the reserved vault name so it does not linger as a ghost entry.
+		// Skip if the engine is shutting down — Pebble may already be closed.
+		if ctx.Err() == nil {
+			if cleanupErr := e.store.DeleteVaultNameOnly(context.Background(), vaultName, wsTarget); cleanupErr != nil {
+				slog.Error("runImport: failed to clean up orphaned vault name after phase 1 failure",
+					"vault", vaultName, "err", cleanupErr)
+			}
+		}
 		return
 	}
 	job.CopyCurrent.Store(result.EngramCount)

@@ -18,12 +18,13 @@ import (
 // JoinHandler handles incoming JoinRequests on the Cortex side.
 // It is safe for concurrent access.
 type JoinHandler struct {
-	localNodeID  string
+	localNodeID   string
+	localAddr     string // this Cortex's advertised address (for JoinResponse.CortexAddr)
 	clusterSecret string
-	epochStore   *EpochStore
-	repLog       *ReplicationLog
-	db           *pebble.DB // non-nil when snapshot streaming is supported
-	mgr          *ConnManager
+	epochStore    *EpochStore
+	repLog        *ReplicationLog
+	db            *pebble.DB // non-nil when snapshot streaming is supported
+	mgr           *ConnManager
 
 	members map[string]NodeInfo
 	mu      sync.RWMutex
@@ -32,6 +33,9 @@ type JoinHandler struct {
 	OnLobeJoined func(info NodeInfo)
 	// OnLobeLeft is called (without mu held) when a Lobe leaves.
 	OnLobeLeft func(nodeID string)
+	// LeaderInfo reports whether this node is the current leader, and if not, the
+	// leader it knows (for join redirects). Only the leader accepts joins (#533).
+	LeaderInfo func() (isLeader bool, leaderID, leaderAddr string)
 }
 
 // NewJoinHandler creates a JoinHandler for the Cortex.
@@ -54,8 +58,29 @@ func NewJoinHandlerWithDB(localNodeID, clusterSecret string, epochStore *EpochSt
 	return h
 }
 
+// ValidSecret reports whether secretHash is a valid HMAC of nodeID (+ role for
+// protocol v2+) under the cluster secret. Always true in open mode.
+// Used to authenticate probes (#531 PR3). The role+protoVer gate matches the
+// logic in HandleJoinRequest so probe and join auth stay in parity (#538).
+func (h *JoinHandler) ValidSecret(nodeID string, role uint8, protoVer uint16, secretHash []byte) bool {
+	if h.clusterSecret == "" {
+		return true
+	}
+	expected := hmac.New(sha256.New, []byte(h.clusterSecret))
+	expected.Write([]byte(nodeID))
+	if protoVer >= 2 {
+		expected.Write([]byte{role})
+	}
+	return hmac.Equal(secretHash, expected.Sum(nil))
+}
+
 // HandleJoinRequest processes a JoinRequest from a connecting Lobe.
-// On success: registers the Lobe in mgr, adds to members map, calls OnLobeJoined.
+// On success it adds the Lobe to the members map and returns an accepted
+// JoinResponse. It deliberately does NOT register the conn in mgr (the
+// coordinator already did so via RegisterConn before calling this) and does
+// NOT fire OnLobeJoined. The caller must invoke FireOnLobeJoined(req.NodeID)
+// only after the JoinResponse — and any post-join snapshot — has been written
+// to the wire. See FireOnLobeJoined for the handshake race this split avoids.
 //
 // Epoch validation: we reject a JoinRequest only when epoch == 0, meaning the
 // cluster has not yet elected a Cortex and cannot safely accept new members.
@@ -74,10 +99,14 @@ func (h *JoinHandler) HandleJoinRequest(req mbp.JoinRequest, conn *PeerConn) mbp
 		}
 	}
 
-	// Validate cluster secret if configured
+	// Validate cluster secret if configured. Protocol v2+ covers Role in the HMAC
+	// to prevent role spoofing (#538); v1 senders use nodeID-only for rolling-upgrade compat.
 	if h.clusterSecret != "" {
 		expectedHash := hmac.New(sha256.New, []byte(h.clusterSecret))
 		expectedHash.Write([]byte(req.NodeID))
+		if req.ProtocolVersion >= 2 {
+			expectedHash.Write([]byte{req.Role})
+		}
 		if !hmac.Equal(req.SecretHash, expectedHash.Sum(nil)) {
 			return mbp.JoinResponse{
 				Accepted:     false,
@@ -91,7 +120,7 @@ func (h *JoinHandler) HandleJoinRequest(req mbp.JoinRequest, conn *PeerConn) mbp
 	// Protocol version check
 	if req.ProtocolVersion > mbp.CurrentProtocolVersion {
 		return mbp.JoinResponse{
-			Accepted:    false,
+			Accepted: false,
 			RejectReason: fmt.Sprintf(
 				"protocol version %d is not supported by this Cortex (max supported: %d). "+
 					"This Lobe binary is newer than the Cortex — upgrade the Cortex first.",
@@ -103,7 +132,7 @@ func (h *JoinHandler) HandleJoinRequest(req mbp.JoinRequest, conn *PeerConn) mbp
 	}
 	if req.ProtocolVersion < mbp.MinSupportedProtocolVersion {
 		return mbp.JoinResponse{
-			Accepted:    false,
+			Accepted: false,
 			RejectReason: fmt.Sprintf(
 				"protocol version %d is no longer supported (minimum: %d, current: %d). "+
 					"Upgrade this Lobe to a binary that speaks protocol version >= %d.",
@@ -138,6 +167,24 @@ func (h *JoinHandler) HandleJoinRequest(req mbp.JoinRequest, conn *PeerConn) mbp
 		}
 	}
 
+	// Leadership gate (#533): only the current leader may accept a join. A
+	// non-leader rejects with a redirect to the leader it knows, so a Lobe that
+	// dialed the wrong node (e.g. another Lobe during a failover) doesn't get a
+	// bogus "you joined me" and start following a non-leader — the root cause of
+	// the mutual-join split-brain.
+	if h.LeaderInfo != nil {
+		isLeader, leaderID, leaderAddr := h.LeaderInfo()
+		if !isLeader {
+			return mbp.JoinResponse{
+				Accepted:     false,
+				RejectReason: "not cortex",
+				Epoch:        currentEpoch,
+				CortexID:     leaderID,
+				CortexAddr:   leaderAddr,
+			}
+		}
+	}
+
 	info := NodeInfo{
 		NodeID:  req.NodeID,
 		Addr:    req.Addr,
@@ -147,20 +194,28 @@ func (h *JoinHandler) HandleJoinRequest(req mbp.JoinRequest, conn *PeerConn) mbp
 
 	h.mu.Lock()
 	h.members[req.NodeID] = info
-	cb := h.OnLobeJoined
 	h.mu.Unlock()
 
-	// Register with ConnManager outside the members lock to avoid lock ordering issues.
-	h.mgr.AddPeer(req.NodeID, req.Addr)
-
-	if cb != nil {
-		cb(info)
-	}
+	// NOTE: do NOT call h.mgr.AddPeer here. The coordinator already called
+	// mgr.RegisterConn(nodeID, addr, conn) with the live inbound TCP connection
+	// before invoking HandleJoinRequest. Calling AddPeer would close that live
+	// connection and replace it with a disconnected PeerConn{conn: nil},
+	// causing the immediately-following peer.Send(JoinResponse) to return
+	// ErrNotConnected.
+	//
+	// NOTE: OnLobeJoined is NOT fired here. Firing it inline would spawn the
+	// NetworkStreamer goroutine before the caller has sent the JoinResponse
+	// frame on the shared PeerConn — racing the streamer's first ReplEntry
+	// frame against the JoinResponse frame and corrupting the lobe-side
+	// handshake parser (issue: cortex join-race / #409 follow-up). The caller
+	// must invoke FireOnLobeJoined(nodeID) after JoinResponse (+ Snapshot)
+	// have been fully written to the wire.
 
 	resp := mbp.JoinResponse{
-		Accepted: true,
-		CortexID: h.localNodeID,
-		Epoch:    currentEpoch,
+		Accepted:   true,
+		CortexID:   h.localNodeID,
+		CortexAddr: h.localAddr,
+		Epoch:      currentEpoch,
 	}
 
 	// Phase 2: if this handler has a DB, every joining Lobe gets a snapshot.
@@ -172,6 +227,32 @@ func (h *JoinHandler) HandleJoinRequest(req mbp.JoinRequest, conn *PeerConn) mbp
 	}
 
 	return resp
+}
+
+// FireOnLobeJoined invokes the OnLobeJoined callback for a previously-registered
+// lobe. Callers must invoke this only AFTER the JoinResponse (and, when
+// applicable, the post-join snapshot stream) has been fully written to the
+// shared PeerConn — otherwise the streamer's first ReplEntry frame can race
+// the JoinResponse frame and break the lobe-side handshake parser.
+func (h *JoinHandler) FireOnLobeJoined(nodeID string) {
+	h.mu.RLock()
+	info, ok := h.members[nodeID]
+	cb := h.OnLobeJoined
+	h.mu.RUnlock()
+	if !ok {
+		// The lobe is not (or no longer) a member. This means a mis-ordered or
+		// duplicate FireOnLobeJoined call — never legitimate. Warn so the bug
+		// surfaces instead of disappearing as a silent no-op.
+		slog.Warn("join: FireOnLobeJoined called for unregistered node; skipping callback",
+			"node", nodeID)
+		return
+	}
+	if cb == nil {
+		// No callback wired (e.g. handler used without a coordinator). Legitimate
+		// no-op — nothing to warn about.
+		return
+	}
+	cb(info)
 }
 
 // StreamSnapshot sends a full Pebble snapshot to the peer over conn.
@@ -227,17 +308,24 @@ type JoinResult struct {
 	// in the snapshot header (authoritative). Otherwise it equals the Lobe's
 	// own LastApplied at join time.
 	StreamFromSeq uint64
+
+	// Conn is the live connection to the Cortex. On a successful Join it is
+	// returned OPEN — the Cortex streams replication frames over this same
+	// connection, so the Lobe keeps it and reads from it (see runAsLobe). The
+	// caller owns closing it. Nil for joinConn callers that pass their own conn.
+	Conn net.Conn
 }
 
 // JoinClient handles the Lobe-side join handshake.
 type JoinClient struct {
-	localNodeID  string
-	localAddr    string
+	localNodeID   string
+	localAddr     string
+	localRole     NodeRole // this node's configured role, advertised in JoinRequest (#529)
 	clusterSecret string
-	epochStore   *EpochStore
-	applier      *Applier
-	db           *pebble.DB // non-nil to enable snapshot reception
-	mgr          *ConnManager
+	epochStore    *EpochStore
+	applier       *Applier
+	db            *pebble.DB // non-nil to enable snapshot reception
+	mgr           *ConnManager
 }
 
 // NewJoinClient creates a JoinClient for a Lobe node.
@@ -266,15 +354,79 @@ func NewJoinClientWithDB(localNodeID, localAddr, clusterSecret string, epochStor
 // received and written to the local DB before this method returns.
 // The caller should start a NetworkStreamer from JoinResult.StreamFromSeq+1.
 // On failure it returns an error; the caller should retry with backoff.
+// Probe sends a side-effect-free leader-discovery JoinRequest{Probe:true} to
+// cortexAddr and returns the response (who the leader is). It does not register,
+// snapshot, or mutate any state — used by a returning designated primary to find
+// the current leader before deciding whether to assert or defer (#531 PR3).
+func (c *JoinClient) Probe(ctx context.Context, cortexAddr string) (mbp.JoinResponse, error) {
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", cortexAddr)
+	if err != nil {
+		return mbp.JoinResponse{}, fmt.Errorf("probe: dial %s: %w", cortexAddr, err)
+	}
+	defer conn.Close()
+
+	var secretHash []byte
+	if c.clusterSecret != "" {
+		h := hmac.New(sha256.New, []byte(c.clusterSecret))
+		h.Write([]byte(c.localNodeID))
+		h.Write([]byte{uint8(c.localRole)})
+		secretHash = h.Sum(nil)
+	}
+	req := mbp.JoinRequest{
+		NodeID:          c.localNodeID,
+		Addr:            c.localAddr,
+		SecretHash:      secretHash,
+		Role:            uint8(c.localRole),
+		Probe:           true,
+		ProtocolVersion: mbp.CurrentProtocolVersion,
+	}
+	payload, err := msgpack.Marshal(req)
+	if err != nil {
+		return mbp.JoinResponse{}, fmt.Errorf("probe: marshal request: %w", err)
+	}
+	if err := mbp.WriteFrame(conn, &mbp.Frame{
+		Version:       0x01,
+		Type:          mbp.TypeJoinRequest,
+		PayloadLength: uint32(len(payload)),
+		Payload:       payload,
+	}); err != nil {
+		return mbp.JoinResponse{}, fmt.Errorf("probe: send request: %w", err)
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetReadDeadline(dl)
+	}
+	respFrame, err := mbp.ReadFrame(conn)
+	if err != nil {
+		return mbp.JoinResponse{}, fmt.Errorf("probe: read response: %w", err)
+	}
+	if respFrame.Type != mbp.TypeJoinResponse {
+		return mbp.JoinResponse{}, fmt.Errorf("probe: unexpected frame type 0x%02x", respFrame.Type)
+	}
+	var resp mbp.JoinResponse
+	if err := msgpack.Unmarshal(respFrame.Payload, &resp); err != nil {
+		return mbp.JoinResponse{}, fmt.Errorf("probe: unmarshal response: %w", err)
+	}
+	return resp, nil
+}
+
 func (c *JoinClient) Join(ctx context.Context, cortexAddr string) (JoinResult, error) {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "tcp", cortexAddr)
 	if err != nil {
 		return JoinResult{}, fmt.Errorf("join: dial %s: %w", cortexAddr, err)
 	}
-	defer conn.Close()
 
-	return c.joinConn(ctx, conn)
+	result, err := c.joinConn(ctx, conn)
+	if err != nil {
+		// The handshake failed — close the conn here. On success we deliberately
+		// leave it OPEN: the Cortex streams replication frames over this same
+		// connection (#448 Bug 2), so the caller (runAsLobe) keeps and reads it.
+		conn.Close()
+		return result, err
+	}
+	result.Conn = conn
+	return result, nil
 }
 
 // joinConn performs the join handshake over an already-established net.Conn.
@@ -312,11 +464,12 @@ func (c *JoinClient) joinConn(ctx context.Context, conn net.Conn) (JoinResult, e
 		lastApplied = c.applier.LastApplied()
 	}
 
-	// Compute HMAC-SHA256 of nodeID using clusterSecret
+	// Compute HMAC-SHA256 of nodeID+role (#538: role covered at proto v2+).
 	var secretHash []byte
 	if c.clusterSecret != "" {
 		h := hmac.New(sha256.New, []byte(c.clusterSecret))
 		h.Write([]byte(c.localNodeID))
+		h.Write([]byte{uint8(c.localRole)})
 		secretHash = h.Sum(nil)
 	}
 
@@ -325,6 +478,7 @@ func (c *JoinClient) joinConn(ctx context.Context, conn net.Conn) (JoinResult, e
 		Addr:            c.localAddr,
 		LastApplied:     lastApplied,
 		SecretHash:      secretHash,
+		Role:            uint8(c.localRole),
 		ProtocolVersion: mbp.CurrentProtocolVersion,
 	}
 

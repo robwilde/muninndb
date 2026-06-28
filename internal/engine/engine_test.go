@@ -2,13 +2,13 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/pebble"
 	"github.com/scrypster/muninndb/internal/auth"
 	"github.com/scrypster/muninndb/internal/engine/activation"
 	"github.com/scrypster/muninndb/internal/engine/trigger"
@@ -39,7 +39,7 @@ func testEnv(t *testing.T) (*Engine, func()) {
 	embedder := &noopEmbedder{}
 	actEngine := activation.New(store, &ftsAdapter{ftsIdx}, nil, embedder)
 	trigSystem := trigger.New(store, &ftsTrigAdapter{ftsIdx}, nil, embedder)
-	eng := NewEngine(store, nil, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+	eng := NewEngine(EngineConfig{Store: store, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 
 	return eng, func() {
 		eng.Stop()    // stop FTS worker, novelty worker, coherence flush, autoAssoc
@@ -48,9 +48,11 @@ func testEnv(t *testing.T) (*Engine, func()) {
 	}
 }
 
-// testEnvWithDB is like testEnv but also returns the underlying *pebble.DB
-// for tests that need to simulate closed-DB conditions.
-func testEnvWithDB(t *testing.T) (*Engine, *pebble.DB, func()) {
+// testEnvWithStore is like testEnv but also returns the underlying *storage.PebbleStore
+// for tests that need to simulate closed-DB conditions. The caller must call
+// store.Close() (not db.Close() directly) so that the counterCoalescer goroutine
+// is drained before the DB is closed — preventing flaky panics in adjacent tests.
+func testEnvWithStore(t *testing.T) (*Engine, *storage.PebbleStore, func()) {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "muninndb-engine-test-*")
 	if err != nil {
@@ -69,9 +71,9 @@ func testEnvWithDB(t *testing.T) (*Engine, *pebble.DB, func()) {
 	embedder := &noopEmbedder{}
 	actEngine := activation.New(store, &ftsAdapter{ftsIdx}, nil, embedder)
 	trigSystem := trigger.New(store, &ftsTrigAdapter{ftsIdx}, nil, embedder)
-	eng := NewEngine(store, nil, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+	eng := NewEngine(EngineConfig{Store: store, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 
-	return eng, db, func() {
+	return eng, store, func() {
 		eng.Stop()
 		// store.Close() may panic or error if db was already closed by the test;
 		// recover gracefully so cleanup always removes the temp dir.
@@ -441,11 +443,11 @@ func TestActivateConfidenceAffectsScore(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	// Two identical engrams differing only in confidence
+	// Two engrams with similar content differing in confidence (unique content to avoid content-hash dedup).
 	if _, err := eng.Write(ctx, &mbp.WriteRequest{
 		Vault:      "test",
 		Concept:    "high confidence fact",
-		Content:    "Go is a compiled programming language built at Google for systems work.",
+		Content:    "Go is a compiled programming language built at Google for systems work. [high]",
 		Confidence: 1.0,
 	}); err != nil {
 		t.Fatalf("Write high confidence: %v", err)
@@ -453,7 +455,7 @@ func TestActivateConfidenceAffectsScore(t *testing.T) {
 	if _, err := eng.Write(ctx, &mbp.WriteRequest{
 		Vault:      "test",
 		Concept:    "low confidence fact",
-		Content:    "Go is a compiled programming language built at Google for systems work.",
+		Content:    "Go is a compiled programming language built at Google for systems work. [low]",
 		Confidence: 0.2,
 	}); err != nil {
 		t.Fatalf("Write low confidence: %v", err)
@@ -510,7 +512,7 @@ func TestEngineWorkersSubmit(t *testing.T) {
 	actEngine := activation.New(store, &ftsAdapter{ftsIdx}, nil, embedder)
 	trigSystem := trigger.New(store, &ftsTrigAdapter{ftsIdx}, nil, embedder)
 
-	eng := NewEngine(store, nil, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+	eng := NewEngine(EngineConfig{Store: store, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 	defer func() {
 		eng.Stop()    // stop FTS worker and other background goroutines before closing db
 		store.Close() // stop PebbleStore background workers and close db
@@ -579,7 +581,7 @@ func TestEngineEvolve(t *testing.T) {
 	}
 	oldID := resp.ID
 
-	newID, err := eng.Evolve(ctx, "test", oldID, "new content", "updated reasoning")
+	newID, err := eng.Evolve(ctx, "test", oldID, "new content", "updated reasoning", nil, "")
 	if err != nil {
 		t.Fatalf("Evolve: %v", err)
 	}
@@ -599,17 +601,17 @@ func TestEngineConsolidate(t *testing.T) {
 	r1, _ := eng.Write(ctx, &mbp.WriteRequest{Vault: "test", Concept: "a", Content: "content a"})
 	r2, _ := eng.Write(ctx, &mbp.WriteRequest{Vault: "test", Concept: "b", Content: "content b"})
 
-	newID, archived, warnings, err := eng.Consolidate(ctx, "test", []string{r1.ID, r2.ID}, "merged content")
+	res, err := eng.Consolidate(ctx, "test", []string{r1.ID, r2.ID}, "merged content")
 	if err != nil {
 		t.Fatalf("Consolidate: %v", err)
 	}
-	if newID == (storage.ULID{}) {
+	if res.MergedID == (storage.ULID{}) {
 		t.Fatal("Consolidate returned zero merged ID")
 	}
-	if len(archived) == 0 {
+	if len(res.Archived) == 0 {
 		t.Fatal("expected at least 1 archived ID")
 	}
-	_ = warnings
+	_ = res.Warnings
 }
 
 func TestEngineSession(t *testing.T) {
@@ -636,12 +638,12 @@ func TestEngineDecide(t *testing.T) {
 
 	r, _ := eng.Write(ctx, &mbp.WriteRequest{Vault: "test", Concept: "evidence", Content: "supporting data"})
 
-	newID, err := eng.Decide(ctx, "test", "go with option A",
+	res, err := eng.Decide(ctx, "test", "go with option A",
 		"rationale text", []string{"option B", "option C"}, []string{r.ID})
 	if err != nil {
 		t.Fatalf("Decide: %v", err)
 	}
-	if newID == (storage.ULID{}) {
+	if res.ID == (storage.ULID{}) {
 		t.Fatal("Decide returned zero ID")
 	}
 }
@@ -830,10 +832,10 @@ func TestEngineTraverseBoundedHops(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	// Build a 4-hop chain: a → b → c → d → e
+	// Build a 4-hop chain: a → b → c → d → e (unique content to avoid content-hash dedup).
 	nodes := make([]string, 5)
 	for i := range nodes {
-		r, _ := eng.Write(ctx, &mbp.WriteRequest{Vault: "test", Concept: "node", Content: "content"})
+		r, _ := eng.Write(ctx, &mbp.WriteRequest{Vault: "test", Concept: "node", Content: fmt.Sprintf("node content %d", i)})
 		nodes[i] = r.ID
 	}
 	for i := 0; i < 4; i++ {
@@ -864,7 +866,7 @@ func TestEngineExplain(t *testing.T) {
 		Content: "JWT token authentication for REST APIs using bearer tokens.",
 	})
 
-	data, err := eng.Explain(ctx, "test", resp.ID, []string{"JWT", "authentication", "bearer"})
+	data, err := eng.Explain(ctx, "test", resp.ID, []string{"JWT", "authentication", "bearer"}, nil)
 	if err != nil {
 		t.Fatalf("Explain: %v", err)
 	}
@@ -1014,13 +1016,13 @@ func TestCoherenceRegistryAfterWrite(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	// Write a few engrams to a named vault.
+	// Write a few engrams to a named vault (unique content to avoid content-hash dedup).
 	vault := "coh-test"
 	for i := 0; i < 3; i++ {
 		if _, err := eng.Write(ctx, &mbp.WriteRequest{
 			Vault:   vault,
 			Concept: "coherence subject",
-			Content: "content for coherence counter test",
+			Content: fmt.Sprintf("content for coherence counter test %d", i),
 		}); err != nil {
 			t.Fatalf("Write[%d]: %v", i, err)
 		}
@@ -1121,7 +1123,7 @@ func TestActivate_PlasticityGatesHebbian(t *testing.T) {
 		t.Fatalf("SetVaultConfig: %v", err)
 	}
 
-	eng := NewEngine(store, as, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+	eng := NewEngine(EngineConfig{Store: store, AuthStore: as, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 	defer func() {
 		eng.Stop()
 		store.Close()
@@ -1153,7 +1155,7 @@ func TestActivate_PlasticityGatesHebbian(t *testing.T) {
 	}
 
 	// Also verify that nil authStore (default test path) gives no panic.
-	eng2 := NewEngine(store, nil, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+	eng2 := NewEngine(EngineConfig{Store: store, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 	defer func() {
 		eng2.Stop()
 	}()
@@ -1217,7 +1219,7 @@ func TestEngine_LobeMode_CollectsEffects(t *testing.T) {
 	trigSystem := trigger.New(store, &ftsTrigAdapter{ftsIdx}, nil, embedder)
 
 	// nil workers — simulates Lobe mode
-	eng := NewEngine(store, nil, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+	eng := NewEngine(EngineConfig{Store: store, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 	defer func() {
 		eng.Stop()
 		store.Close()
@@ -1322,7 +1324,7 @@ func TestEngine_CortexMode_NoForwarding(t *testing.T) {
 	trigSystem := trigger.New(store, &ftsTrigAdapter{ftsIdx}, nil, embedder)
 
 	// nil workers — but we do NOT wire a coordinator
-	eng := NewEngine(store, nil, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+	eng := NewEngine(EngineConfig{Store: store, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 	defer func() {
 		eng.Stop()
 		store.Close()
@@ -1662,7 +1664,7 @@ func TestEngineRead_AfterRestart(t *testing.T) {
 		embedder := &noopEmbedder{}
 		actEngine := activation.New(store, &ftsAdapter{ftsIdx}, nil, embedder)
 		trigSystem := trigger.New(store, &ftsTrigAdapter{ftsIdx}, nil, embedder)
-		eng := NewEngine(store, nil, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+		eng := NewEngine(EngineConfig{Store: store, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 		return eng, func() {
 			eng.Stop()
 			store.Close()
@@ -1917,7 +1919,7 @@ func TestActivateCore_VaultDefaultRecallMode(t *testing.T) {
 		t.Fatalf("SetVaultConfig: %v", err)
 	}
 
-	eng := NewEngine(store, as, ftsIdx, actEngine, trigSystem, nil, nil, nil, embedder, nil)
+	eng := NewEngine(EngineConfig{Store: store, AuthStore: as, FTSIndex: ftsIdx, ActivationEngine: actEngine, TriggerSystem: trigSystem, Embedder: embedder})
 	defer func() {
 		eng.Stop()
 		store.Close()
@@ -2110,5 +2112,316 @@ func TestEngineTraverse_EdgeRelTypePopulated(t *testing.T) {
 	}
 	if edges[0].RelType != storage.RelSupports {
 		t.Errorf("edge RelType = %v (%d), want storage.RelSupports (%d)", edges[0].RelType, edges[0].RelType, storage.RelSupports)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestWrite_AutoStampsTrustInferred: Write should auto-stamp TrustInferred
+// ---------------------------------------------------------------------------
+
+// TestWrite_AutoStampsTrustInferred verifies that Write auto-stamps TrustInferred
+// on new engrams and that Trust is propagated through Read and Activate responses.
+func TestWrite_AutoStampsTrustInferred(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	// Write an engram without specifying Trust
+	writeResp, err := eng.Write(ctx, &mbp.WriteRequest{
+		Vault:   "test",
+		Concept: "trust inference test",
+		Content: "This engram should get TrustInferred automatically.",
+	})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if writeResp.ID == "" {
+		t.Fatal("expected non-empty ID from Write")
+	}
+
+	// Read it back and verify Trust == TrustInferred
+	readResp, err := eng.Read(ctx, &mbp.ReadRequest{
+		Vault: "test",
+		ID:    writeResp.ID,
+	})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if readResp.Trust != uint8(storage.TrustInferred) {
+		t.Errorf("ReadResponse.Trust = %d, want %d (TrustInferred)", readResp.Trust, uint8(storage.TrustInferred))
+	}
+}
+
+// TestWriteBatch_AutoStampsTrustInferred verifies that WriteBatch auto-stamps
+// TrustInferred on new engrams and that Trust is visible via Read.
+func TestWriteBatch_AutoStampsTrustInferred(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	reqs := []*mbp.WriteRequest{
+		{
+			Vault:   "test",
+			Concept: "batch trust test",
+			Content: "This batch engram should get TrustInferred automatically.",
+		},
+	}
+
+	responses, errs := eng.WriteBatch(ctx, reqs)
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(responses))
+	}
+	if errs[0] != nil {
+		t.Fatalf("WriteBatch: %v", errs[0])
+	}
+	if responses[0] == nil || responses[0].ID == "" {
+		t.Fatal("expected non-empty ID from WriteBatch")
+	}
+
+	readResp, err := eng.Read(ctx, &mbp.ReadRequest{
+		Vault: "test",
+		ID:    responses[0].ID,
+	})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if readResp.Trust != uint8(storage.TrustInferred) {
+		t.Errorf("ReadResponse.Trust = %d, want %d (TrustInferred)", readResp.Trust, uint8(storage.TrustInferred))
+	}
+}
+
+// TestActivate_TrustPropagation verifies that Trust is propagated into
+// ActivationItem results returned by Activate.
+func TestActivate_TrustPropagation(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	_, err := eng.Write(ctx, &mbp.WriteRequest{
+		Vault:   "test",
+		Concept: "trust activation test",
+		Content: "Trust propagation through activation results.",
+	})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	awaitFTS(t, eng)
+
+	resp, err := eng.Activate(ctx, &mbp.ActivateRequest{
+		Vault:      "test",
+		Context:    []string{"trust propagation activation results"},
+		MaxResults: 10,
+		Threshold:  0.01,
+	})
+	if err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	if len(resp.Activations) == 0 {
+		t.Fatal("Activate returned 0 results, want >= 1")
+	}
+
+	found := false
+	for _, item := range resp.Activations {
+		if item.Concept == "trust activation test" {
+			found = true
+			if item.Trust != uint8(storage.TrustInferred) {
+				t.Errorf("ActivationItem.Trust = %d, want %d (TrustInferred)", item.Trust, uint8(storage.TrustInferred))
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("did not find 'trust activation test' engram in Activate results")
+	}
+}
+
+// TestEvolve_AutoStampsTrustInferred verifies that Evolve auto-stamps
+// TrustInferred on the new engram it creates.
+func TestEvolve_AutoStampsTrustInferred(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	writeResp, err := eng.Write(ctx, &mbp.WriteRequest{
+		Vault:   "test",
+		Concept: "evolve trust test",
+		Content: "Original content before evolution.",
+	})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	newULID, err := eng.Evolve(ctx, "test", writeResp.ID, "Evolved content after trust stamp.", "trust test evolution", nil, "")
+	if err != nil {
+		t.Fatalf("Evolve: %v", err)
+	}
+	if newULID == (storage.ULID{}) {
+		t.Fatal("Evolve returned zero ID")
+	}
+
+	readResp, err := eng.Read(ctx, &mbp.ReadRequest{
+		Vault: "test",
+		ID:    newULID.String(),
+	})
+	if err != nil {
+		t.Fatalf("Read new engram: %v", err)
+	}
+	if readResp.Trust != uint8(storage.TrustInferred) {
+		t.Errorf("ReadResponse.Trust = %d, want %d (TrustInferred)", readResp.Trust, uint8(storage.TrustInferred))
+	}
+}
+
+func TestEngine_SetTrust(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	resp, err := eng.Write(context.Background(), &mbp.WriteRequest{
+		Vault:   "default",
+		Content: "content for set-trust test",
+		Concept: "set-trust concept",
+	})
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if err := eng.SetTrust(context.Background(), "default", resp.ID, "verified"); err != nil {
+		t.Fatalf("SetTrust: %v", err)
+	}
+
+	readResp, err := eng.Read(context.Background(), &mbp.ReadRequest{ID: resp.ID, Vault: "default"})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if readResp.Trust != uint8(storage.TrustVerified) {
+		t.Errorf("Trust = %d, want %d (TrustVerified)", readResp.Trust, storage.TrustVerified)
+	}
+
+	if err := eng.SetTrust(context.Background(), "default", resp.ID, "bogus"); err == nil {
+		t.Error("expected error for invalid trust string")
+	}
+
+	// SetTrust on a nonexistent engram returns an error
+	fakeID := "01ARZ3NDEKTSV4RRFFQ69G5FAV" // valid ULID format but no such engram
+	if err := eng.SetTrust(context.Background(), "default", fakeID, "verified"); err == nil {
+		t.Error("expected error for nonexistent engram")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: WriteRequest.CreatedAt bounds validation
+// ---------------------------------------------------------------------------
+
+func TestEngineWrite_CreatedAtFuture(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	future := time.Now().Add(10 * time.Minute)
+	_, err := eng.Write(context.Background(), &mbp.WriteRequest{
+		Vault:     "test",
+		Concept:   "x",
+		Content:   "test",
+		CreatedAt: &future,
+	})
+	if err == nil {
+		t.Error("expected error for future CreatedAt, got nil")
+	}
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Errorf("expected ErrInvalidRequest, got: %v", err)
+	}
+}
+
+func TestEngineWrite_CreatedAtTooOld(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	ancient := time.Date(1999, 12, 31, 0, 0, 0, 0, time.UTC)
+	_, err := eng.Write(context.Background(), &mbp.WriteRequest{
+		Vault:     "test",
+		Concept:   "x",
+		Content:   "test",
+		CreatedAt: &ancient,
+	})
+	if err == nil {
+		t.Error("expected error for CreatedAt before 2000-01-01, got nil")
+	}
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Errorf("expected ErrInvalidRequest, got: %v", err)
+	}
+}
+
+func TestEngineWrite_CreatedAtValid(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	past := time.Now().Add(-24 * time.Hour)
+	_, err := eng.Write(context.Background(), &mbp.WriteRequest{
+		Vault:     "test",
+		Concept:   "x",
+		Content:   "test",
+		CreatedAt: &past,
+	})
+	if err != nil {
+		t.Errorf("expected no error for valid past CreatedAt, got: %v", err)
+	}
+}
+
+func TestEngineWriteBatch_CreatedAtFuture(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	future := time.Now().Add(10 * time.Minute)
+	_, errs := eng.WriteBatch(context.Background(), []*mbp.WriteRequest{
+		{
+			Vault:     "test",
+			Concept:   "x",
+			Content:   "test",
+			CreatedAt: &future,
+		},
+	})
+	if len(errs) == 0 || errs[0] == nil {
+		t.Error("expected error for future CreatedAt in batch, got nil")
+	}
+	if !errors.Is(errs[0], ErrInvalidRequest) {
+		t.Errorf("expected ErrInvalidRequest, got: %v", errs[0])
+	}
+}
+
+func TestEngineWriteBatch_CreatedAtTooOld(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	ancient := time.Date(1999, 12, 31, 0, 0, 0, 0, time.UTC)
+	_, errs := eng.WriteBatch(context.Background(), []*mbp.WriteRequest{
+		{
+			Vault:     "test",
+			Concept:   "x",
+			Content:   "test",
+			CreatedAt: &ancient,
+		},
+	})
+	if len(errs) == 0 || errs[0] == nil {
+		t.Error("expected error for CreatedAt before 2000-01-01 in batch, got nil")
+	}
+	if !errors.Is(errs[0], ErrInvalidRequest) {
+		t.Errorf("expected ErrInvalidRequest, got: %v", errs[0])
+	}
+}
+
+func TestEngineWriteBatch_CreatedAtValid(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+
+	past := time.Now().Add(-24 * time.Hour)
+	_, errs := eng.WriteBatch(context.Background(), []*mbp.WriteRequest{
+		{
+			Vault:     "test",
+			Concept:   "x",
+			Content:   "test",
+			CreatedAt: &past,
+		},
+	})
+	if len(errs) > 0 && errs[0] != nil {
+		t.Errorf("expected no error for valid past CreatedAt in batch, got: %v", errs[0])
 	}
 }

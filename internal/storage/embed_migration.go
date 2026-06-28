@@ -2,20 +2,27 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/scrypster/muninndb/internal/storage/keys"
 )
 
-// ClearEmbedFlagsForVault clears the DigestEmbed flag (bit 0x02) on every engram's
-// 0x11 digest record within the given vault, and range-deletes all 0x18 (embedding)
-// keys for the vault. This causes the RetroactiveProcessor to re-embed every engram
-// on its next scan cycle.
+// ClearEmbedFlagsForVault clears the DigestEmbed (0x02) and DigestEmbedFailed
+// (0x80) flags on every engram's 0x11 digest record within the given vault, and
+// range-deletes all 0x18 (embedding) keys for the vault. This causes the
+// RetroactiveProcessor to re-embed every engram on its next scan cycle,
+// including engrams that previously failed to embed.
 //
-// Returns the number of digest flags that were cleared.
+// Engrams that have no existing digest record are written a zero record so they
+// are explicitly tracked and eligible for re-embedding.
+//
+// Returns the number of digest records that were written (created or updated).
 func (ps *PebbleStore) ClearEmbedFlagsForVault(ctx context.Context, ws [8]byte) (int64, error) {
 	const DigestEmbed uint8 = 0x02
+	const DigestEmbedFailed uint8 = 0x80
+	const embedMask uint8 = DigestEmbed | DigestEmbedFailed
 
 	wsPlus, err := keys.IncrementWSPrefix(ws)
 	if err != nil {
@@ -70,16 +77,25 @@ func (ps *PebbleStore) ClearEmbedFlagsForVault(ctx context.Context, ws [8]byte) 
 		copy(id[:], k[9:25])
 
 		raw, err := ps.getDigestFlagsRaw(id)
-		if err != nil {
-			// No digest record yet — nothing to clear.
-			continue
+		noRecord := errors.Is(err, pebble.ErrNotFound)
+		if err != nil && !noRecord {
+			return cleared, fmt.Errorf("clear embed flags: get digest: %w", err)
 		}
-		if raw&DigestEmbed == 0 {
-			// Already cleared.
+		if noRecord {
+			raw = 0
+		}
+
+		// If an existing record already has both flags clear, there is nothing to
+		// do — skip it. But if there is NO record at all (noRecord), we must fall
+		// through and write the zero record so the RetroactiveProcessor explicitly
+		// sees this engram as pending embedding (fixes the silent skip introduced
+		// by the Bug 3 guard: raw=0 caused raw&embedMask==0 to be true, meaning
+		// the zero write was never reached for freshly imported engrams).
+		if !noRecord && raw&embedMask == 0 {
 			continue
 		}
 
-		raw &^= DigestEmbed
+		raw &^= embedMask
 		flagKey := keys.DigestFlagsKey(id)
 		if err := batch.Set(flagKey, []byte{raw}, nil); err != nil {
 			return cleared, fmt.Errorf("clear embed flags: batch set: %w", err)

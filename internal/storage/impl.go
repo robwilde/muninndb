@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/scrypster/muninndb/internal/provenance"
+	"github.com/scrypster/muninndb/internal/scoring"
 	"github.com/scrypster/muninndb/internal/storage/erf"
 	"github.com/scrypster/muninndb/internal/storage/keys"
 	"github.com/scrypster/muninndb/internal/wal"
@@ -30,6 +32,11 @@ type PebbleStoreConfig struct {
 	// When true, the existing walSyncer provides durability within 10ms.
 	// Default false preserves the previous per-write fsync behavior.
 	NoSyncEngrams bool
+	// RepLogAppend, when non-nil, is called after every successful batch.Commit()
+	// on data-bearing write paths. op=3 (OpBatch) with value=batch.Repr() captures
+	// all keys atomically. Non-fatal: errors are logged, not returned.
+	// Only populated when cluster mode is enabled.
+	RepLogAppend func(op uint8, key, value []byte) error
 }
 
 // PebbleStore is the concrete Pebble-backed implementation of EngineStore.
@@ -41,6 +48,7 @@ type PebbleStore struct {
 	noSyncEngrams bool
 	vaultCounters sync.Map          // [8]byte -> *vaultCounter
 	provenance    *provenance.Store // Provenance chain for tracking engram creation/updates
+	scoringStore  *scoring.Store    // Per-vault learnable scoring weights
 	walSync       *walSyncer        // Periodic WAL fsync — covers all pebble.NoSync writes
 	counterFlush  *counterCoalescer // Coalesces vault count Pebble writes (100ms timer)
 	provWork      *provenanceWorker // NumCPU goroutines for provenance appends
@@ -68,14 +76,19 @@ type PebbleStore struct {
 	// All transition reads/writes go through this layer; Pebble is only hit on
 	// cold-start loads and periodic flushes.
 	transCache *TransitionCache
-	closeOnce   sync.Once
-	entityLocks       sync.Map // key: normalized entity name → *sync.Mutex
-	coOccurrenceLocks sync.Map // key: "hashA:hashB" → *sync.Mutex
+	closeOnce  sync.Once
+	// entityLocks and coOccurrenceLocks use fixed-size striped mutex arrays instead of
+	// sync.Map to bound memory growth. sync.Map grows unbounded (one entry per unique key
+	// ever seen); stripedMutex uses a constant 256 × sizeof(sync.Mutex) ≈ 6 KB.
+	entityLocks       stripedMutex // prevents TOCTOU in UpsertEntityRecord
+	coOccurrenceLocks stripedMutex // prevents TOCTOU in IncrementEntityCoOccurrence
 	// archiveBloom is an in-memory Bloom filter over src engram IDs that have
 	// archived associations in the 0x25 namespace. Gates the 0x25 prefix scan
 	// during BFS traversal: if the filter says "no," skip the scan entirely.
 	// Rebuilt on startup and after GC runs via RebuildArchiveBloom.
 	archiveBloom *archiveBloom
+	// repLogAppend is the cluster replication callback. nil in non-cluster mode.
+	repLogAppend func(op uint8, key, value []byte) error
 }
 
 // assocCacheEntry holds a cached association list.
@@ -175,6 +188,7 @@ func NewPebbleStore(db *pebble.DB, cfg PebbleStoreConfig) *PebbleStore {
 		db:               db,
 		cache:            NewL1Cache(cfg.CacheSize),
 		provenance:       prov,
+		scoringStore:     scoring.NewStore(db),
 		noSyncEngrams:    cfg.NoSyncEngrams,
 		metaCache:        metaCache,
 		vaultPrefixCache: vaultPrefixCache,
@@ -185,6 +199,7 @@ func NewPebbleStore(db *pebble.DB, cfg PebbleStoreConfig) *PebbleStore {
 	ps.provWork = newProvenanceWorker(prov)
 	ps.transCache = NewTransitionCache(ps)
 	ps.archiveBloom = ps.RebuildArchiveBloom()
+	ps.repLogAppend = cfg.RepLogAppend
 	return ps
 }
 
@@ -198,6 +213,23 @@ func (ps *PebbleStore) CacheLen() int {
 func (ps *PebbleStore) SetWAL(mol *wal.MOL, gc *wal.GroupCommitter) {
 	ps.mol = mol
 	ps.gc = gc
+}
+
+// replicateBatch appends the batch's complete key-value set to the replication
+// log as a single OpBatch entry (op=3). Captures batch.Repr() which remains
+// valid after Commit() and before Close(). Non-fatal: logs errors.
+// Must be called after a successful batch.Commit() and before batch.Close().
+func (ps *PebbleStore) replicateBatch(b *pebble.Batch) {
+	if ps.repLogAppend == nil {
+		return
+	}
+	repr := b.Repr()
+	if len(repr) == 0 {
+		return
+	}
+	if err := ps.repLogAppend(3, nil, repr); err != nil { // 3 = OpBatch
+		slog.Warn("storage: replication log batch append failed", "err", err)
+	}
 }
 
 // VaultPrefix computes the 8-byte SipHash prefix for a vault name.
@@ -307,6 +339,8 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 	if err := batch.Commit(syncOption); err != nil {
 		return ULID{}, fmt.Errorf("commit batch: %w", err)
 	}
+
+	ps.replicateBatch(batch)
 
 	// NOTE: Intentionally NOT caching on write to avoid flooding L1 cache.
 
@@ -473,6 +507,8 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 		return ids, errs
 	}
 
+	ps.replicateBatch(batch)
+
 	// Post-commit: vault counters, WAL/MOL, provenance — per item.
 	for i := range items {
 		if errs[i] != nil {
@@ -543,10 +579,109 @@ func (ps *PebbleStore) ReadCoherence(vaultPrefix [8]byte) ([7]int64, bool, error
 	return data, true, nil
 }
 
-// GetDB returns the underlying Pebble database instance.
-// Used for accessing Pebble directly (e.g., by scoring store).
-func (ps *PebbleStore) GetDB() *pebble.DB {
-	return ps.db
+// WriteDreamState persists per-vault dream state to Pebble.
+// Value is 16 bytes: last_dream_at (BigEndian int64 unix nanos) + engrams_at_dream (BigEndian int64).
+func (ps *PebbleStore) WriteDreamState(vaultPrefix [8]byte, lastDreamAt time.Time, engramsAtDream int64) error {
+	buf := make([]byte, 16)
+	binary.BigEndian.PutUint64(buf[0:8], uint64(lastDreamAt.UnixNano()))
+	binary.BigEndian.PutUint64(buf[8:16], uint64(engramsAtDream))
+	return ps.db.Set(keys.DreamStateKey(vaultPrefix), buf, pebble.Sync)
+}
+
+// ReadDreamState loads per-vault dream state from Pebble.
+// Returns (lastDreamAt, engramsAtDream, true, nil) if found, (zero, 0, false, nil) if not found.
+func (ps *PebbleStore) ReadDreamState(vaultPrefix [8]byte) (time.Time, int64, bool, error) {
+	val, closer, err := ps.db.Get(keys.DreamStateKey(vaultPrefix))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return time.Time{}, 0, false, nil
+	}
+	if err != nil {
+		return time.Time{}, 0, false, fmt.Errorf("read dream state: %w", err)
+	}
+	defer closer.Close()
+	if len(val) != 16 {
+		return time.Time{}, 0, false, fmt.Errorf("dream state: unexpected value length %d", len(val))
+	}
+	nanos := int64(binary.BigEndian.Uint64(val[0:8]))
+	engramCount := int64(binary.BigEndian.Uint64(val[8:16]))
+	return time.Unix(0, nanos), engramCount, true, nil
+}
+
+// Checkpoint creates a Pebble checkpoint (consistent on-disk snapshot) at destDir.
+func (ps *PebbleStore) Checkpoint(destDir string) error {
+	return ps.db.Checkpoint(destDir)
+}
+
+// PebbleMetrics returns the raw Pebble metrics for observability and diagnostics.
+func (ps *PebbleStore) PebbleMetrics() *pebble.Metrics {
+	return ps.db.Metrics()
+}
+
+// ScoringStore returns the scoring.Store that manages per-vault learnable weights.
+// The store is constructed once at PebbleStore creation and shared — callers must
+// not close it independently.
+func (ps *PebbleStore) ScoringStore() *scoring.Store {
+	return ps.scoringStore
+}
+
+// ProvenanceStore returns the provenance.Store used for audit trail appends.
+// The store is constructed once at PebbleStore creation and shared — callers must
+// not close it independently.
+func (ps *PebbleStore) ProvenanceStore() *provenance.Store {
+	return ps.provenance
+}
+
+// ClearFTSKeys deletes all FTS index keys for the given vault workspace prefix via
+// range tombstones. Prefixes cleared: 0x05 (posting lists), 0x06 (trigrams),
+// 0x08 (FTS global stats), 0x09 (per-term stats).
+func (ps *PebbleStore) ClearFTSKeys(ws, wsPlus [8]byte) error {
+	ftsPrefixes := []byte{0x05, 0x06, 0x08, 0x09}
+	batch := ps.db.NewBatch()
+	for _, p := range ftsPrefixes {
+		lo := make([]byte, 9)
+		lo[0] = p
+		copy(lo[1:], ws[:])
+		hi := make([]byte, 9)
+		hi[0] = p
+		copy(hi[1:], wsPlus[:])
+		if err := batch.DeleteRange(lo, hi, nil); err != nil {
+			batch.Close()
+			return fmt.Errorf("storage: clear FTS keys 0x%02X: %w", p, err)
+		}
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		batch.Close()
+		return fmt.Errorf("storage: commit FTS clear batch: %w", err)
+	}
+	batch.Close()
+	return nil
+}
+
+// SetFTSVersionMarker writes the FTS schema version marker for the given workspace.
+func (ps *PebbleStore) SetFTSVersionMarker(ws [8]byte, version byte) error {
+	versionKey := keys.FTSVersionKey(ws)
+	if err := ps.db.Set(versionKey, []byte{version}, pebble.Sync); err != nil {
+		return fmt.Errorf("storage: set FTS version marker: %w", err)
+	}
+	return nil
+}
+
+// FTSVersionMarker reads the FTS schema version marker for the given workspace.
+// Returns the version byte, true if set, or 0, false if not yet written.
+func (ps *PebbleStore) FTSVersionMarker(ws [8]byte) (byte, bool, error) {
+	versionKey := keys.FTSVersionKey(ws)
+	val, closer, err := ps.db.Get(versionKey)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("storage: get FTS version marker: %w", err)
+	}
+	defer closer.Close()
+	if len(val) == 0 {
+		return 0, false, nil
+	}
+	return val[0], true, nil
 }
 
 // TransitionCache returns the tiered PAS transition cache.

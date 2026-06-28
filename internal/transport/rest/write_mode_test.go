@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/scrypster/muninndb/internal/auth"
@@ -60,13 +61,16 @@ func TestWriteOnlyMode_ReadHandlersBlocked(t *testing.T) {
 		{"Contradictions", "GET", s.handleContradictions},
 		{"Guide", "GET", s.handleGuide},
 		{"Stats", "GET", s.handleStats},
-		// POST mutation endpoints that return full engram payloads — blocked to
-		// prevent data exfiltration via response body (hardening round 1).
+		// POST/PUT mutation endpoints that return vault data — blocked to
+		// prevent data exfiltration via response body (hardening rounds 1 & 2).
 		{"Evolve", "POST", s.handleEvolve},
 		{"Consolidate", "POST", s.handleConsolidateEngrams},
 		{"Decide", "POST", s.handleDecide},
 		{"Restore", "POST", s.handleRestore},
 		{"RetryEnrich", "POST", s.handleRetryEnrich},
+		// PUT mutation endpoints that return state/tag data — blocked in hardening round 2.
+		{"SetState", "PUT", s.handleSetState},
+		{"UpdateTags", "PUT", s.handleUpdateTags},
 	}
 
 	for _, tc := range cases {
@@ -97,8 +101,6 @@ func TestWriteOnlyMode_WriteHandlersNotBlocked(t *testing.T) {
 		{"BatchCreate", s.handleBatchCreate},
 		{"Link", s.handleLink},
 		{"DeleteEngram", s.handleDeleteEngram},
-		{"SetState", s.handleSetState},
-		{"UpdateTags", s.handleUpdateTags},
 	}
 
 	for _, tc := range cases {
@@ -164,6 +166,174 @@ func TestWriteOnlyMode_ObserveModeCanRead(t *testing.T) {
 			auth.WriteOnlyGuard(tc.handler)(w, req)
 			if w.Code == http.StatusForbidden {
 				t.Errorf("%s: observe mode must not return 403", tc.name)
+			}
+		})
+	}
+}
+
+func TestReadOnlyMode_MutatingHandlersBlocked(t *testing.T) {
+	s := newWriteModeTestServer(t)
+
+	cases := []struct {
+		name    string
+		method  string
+		handler http.HandlerFunc
+	}{
+		{"CreateEngram", http.MethodPost, s.handleCreateEngram},
+		{"BatchCreate", http.MethodPost, s.handleBatchCreate},
+		{"Link", http.MethodPost, s.handleLink},
+		{"DeleteEngram", http.MethodDelete, s.handleDeleteEngram},
+		{"SetState", http.MethodPut, s.handleSetState},
+		{"UpdateTags", http.MethodPut, s.handleUpdateTags},
+		{"Evolve", http.MethodPost, s.handleEvolve},
+		{"Consolidate", http.MethodPost, s.handleConsolidateEngrams},
+		{"Decide", http.MethodPost, s.handleDecide},
+		{"Restore", http.MethodPost, s.handleRestore},
+		{"RetryEnrich", http.MethodPost, s.handleRetryEnrich},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, "/", nil)
+			req = withObserveCtx(req)
+			w := httptest.NewRecorder()
+			auth.ReadOnlyGuard(tc.handler)(w, req)
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestReadOnlyMode_SemanticReadHandlersPassThrough(t *testing.T) {
+	store := newTestAuthStore(t)
+	if err := store.SetVaultConfig(auth.VaultConfig{Name: "default", Public: false}); err != nil {
+		t.Fatalf("SetVaultConfig: %v", err)
+	}
+	s := newTestServer(t, store)
+
+	observeToken, _, err := store.GenerateAPIKey("default", "observer", auth.ModeObserve, nil)
+	if err != nil {
+		t.Fatalf("GenerateAPIKey observe: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		path string
+		body string
+	}{
+		{"Activate", "/api/activate?vault=default", `{"context":["x"]}`},
+		{"BatchGetEngramLinks", "/api/engrams/links/batch?vault=default", `{"ids":["id1"]}`},
+		{"Traverse", "/api/traverse?vault=default", `{"start_id":"root-id"}`},
+		{"Explain", "/api/explain?vault=default", `{"engram_id":"some-id"}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer "+observeToken)
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			s.mux.ServeHTTP(w, req)
+			if w.Code == http.StatusUnauthorized {
+				t.Fatalf("observe key should authenticate semantic read endpoint, got 401: %s", w.Body.String())
+			}
+			if w.Code == http.StatusForbidden {
+				t.Fatalf("semantic read endpoint must remain available to observe keys")
+			}
+		})
+	}
+}
+
+func TestPublicVaultFullModeMutationsPassThrough(t *testing.T) {
+	store := newTestAuthStore(t)
+	if err := store.SetVaultConfig(auth.VaultConfig{Name: "default", Public: true}); err != nil {
+		t.Fatalf("SetVaultConfig: %v", err)
+	}
+	s := newTestServer(t, store)
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{"CreateEngram", http.MethodPost, "/api/engrams?vault=default", `{"concept":"test","content":"hello"}`},
+		{"BatchCreate", http.MethodPost, "/api/engrams/batch?vault=default", `{"engrams":[{"concept":"a","content":"x"}]}`},
+		{"DeleteEngram", http.MethodDelete, "/api/engrams/" + testEngramID + "?vault=default", ``},
+		{"Link", http.MethodPost, "/api/link?vault=default", `{"source_id":"id1","target_id":"id2","rel_type":1}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			if tc.body != "" {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			w := httptest.NewRecorder()
+			s.mux.ServeHTTP(w, req)
+			if w.Code == http.StatusUnauthorized {
+				t.Fatalf("public full-mode access should not require auth, got 401: %s", w.Body.String())
+			}
+			if w.Code == http.StatusForbidden {
+				t.Fatalf("expected non-403 response, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestReadOnlyMode_PublicVaultSemanticReadEndpointsPassThrough(t *testing.T) {
+	store := newTestAuthStore(t)
+	if err := store.SetVaultConfig(auth.VaultConfig{Name: "default", Public: true}); err != nil {
+		t.Fatalf("SetVaultConfig: %v", err)
+	}
+	s := newTestServer(t, store)
+
+	cases := []struct {
+		name string
+		path string
+		body string
+	}{
+		{"Activate", "/api/activate?vault=default", `{"context":["x"]}`},
+		{"BatchGetEngramLinks", "/api/engrams/links/batch?vault=default", `{"ids":["id1"]}`},
+		{"Traverse", "/api/traverse?vault=default", `{"start_id":"root-id"}`},
+		{"Explain", "/api/explain?vault=default", `{"engram_id":"some-id"}`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			s.mux.ServeHTTP(w, req)
+			if w.Code == http.StatusForbidden {
+				t.Fatalf("expected non-403 response, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestWriteOnlyMode_FullModeCanMutateStateAndTags verifies that full-mode
+// sessions can call PUT state and PUT tags (regression for hardening round 2).
+func TestWriteOnlyMode_FullModeCanMutateStateAndTags(t *testing.T) {
+	s := newWriteModeTestServer(t)
+
+	cases := []struct {
+		name    string
+		handler http.HandlerFunc
+	}{
+		{"SetState", s.handleSetState},
+		{"UpdateTags", s.handleUpdateTags},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "/", nil)
+			req = withFullCtx(req)
+			w := httptest.NewRecorder()
+			auth.ReadOnlyGuard(auth.WriteOnlyGuard(tc.handler))(w, req)
+			if w.Code == http.StatusForbidden {
+				t.Errorf("%s: full mode must not return 403", tc.name)
 			}
 		})
 	}
